@@ -34,7 +34,7 @@ classDiagram
         +Now() time.Time
     }
 
-    class realClock {
+    class SystemClock {
         +Now() time.Time
     }
 
@@ -94,7 +94,7 @@ classDiagram
     Algorithm <|.. FixedWindowCounter : implements
     Algorithm <|.. SlidingWindowLog : implements
 
-    Clock <|.. realClock : implements
+    Clock <|.. SystemClock : implements
 
     TokenBucket ..> validate : calls in constructor
     LeakyBucket ..> validate : calls in constructor
@@ -118,7 +118,7 @@ one interprets "rate" in its own shape — `rate+burst` vs
   arrives as a plain argument, every algorithm is trivial to
   unit-test on its own — just call `Allow(fixedTime)`, no fake clock
   or mock needed. In production code the caller passes the library's
-  `realClock`; there is no implicit default.
+  `SystemClock`; there is no implicit default.
 - **`validate`** — a small set of package-level helper functions
   (`validate.Rate`, `validate.Window`, ...) that each algorithm's
   constructor calls to reject invalid input (`rate <= 0`,
@@ -142,7 +142,7 @@ algorithm.
 flowchart LR
     A["client code"] -->|"NewTokenBucket(rate, burst)"| B["TokenBucket\n(Algorithm)"]
     A -->|"New(algorithm, clock)"| C["Limiter"]
-    A -->|"realClock{}"| E["Clock"]
+    A -->|"SystemClock{}"| E["Clock"]
     B -.->|"passed in as\nAlgorithm"| C
     E -.->|"passed in as\nClock"| C
     C -->|"now := clock.Now()"| E
@@ -162,6 +162,6 @@ To add a new rate-limiting algorithm:
 3. Validate its constructor arguments using the shared `validate`
    helpers.
 4. Pass an instance of the new struct, together with a `Clock`
-   (typically `realClock`), into `ratelimit.New(algorithm, clock)`.
+   (typically `SystemClock`), into `ratelimit.New(algorithm, clock)`.
 
 `Limiter` and the rest of the library remain unchanged.
