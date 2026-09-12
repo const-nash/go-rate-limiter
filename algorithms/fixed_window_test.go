@@ -1,12 +1,14 @@
-package algorithms
+package algorithms_test
 
 import (
 	"testing"
 	"time"
+
+	"github.com/const-nash/go-rate-limiter/algorithms"
 )
 
 func TestFixedWindowCounter_AllowsUpToLimit(t *testing.T) {
-	fw := NewFixedWindowCounter(3, time.Minute)
+	fw := algorithms.NewFixedWindowCounter(3, time.Minute)
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 3; i++ {
@@ -26,7 +28,7 @@ func TestFixedWindowCounter_AllowsUpToLimit(t *testing.T) {
 }
 
 func TestFixedWindowCounter_ResetsAfterWindowElapses(t *testing.T) {
-	fw := NewFixedWindowCounter(1, time.Minute)
+	fw := algorithms.NewFixedWindowCounter(1, time.Minute)
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	res := fw.Allow(now)
@@ -45,7 +47,7 @@ func TestFixedWindowCounter_ResetsAfterWindowElapses(t *testing.T) {
 }
 
 func TestFixedWindowCounter_AllowN(t *testing.T) {
-	fw := NewFixedWindowCounter(10, time.Minute)
+	fw := algorithms.NewFixedWindowCounter(10, time.Minute)
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	res := fw.AllowN(now, 7)
@@ -63,7 +65,7 @@ func TestFixedWindowCounter_AllowN(t *testing.T) {
 }
 
 func TestFixedWindowCounter_RetryAfterAndResetAt(t *testing.T) {
-	fw := NewFixedWindowCounter(1, time.Minute)
+	fw := algorithms.NewFixedWindowCounter(1, time.Minute)
 	now := time.Date(2026, 1, 1, 0, 0, 30, 0, time.UTC)
 
 	fw.Allow(now)
@@ -99,7 +101,7 @@ func TestFixedWindowCounter_InvalidArgsPanic(t *testing.T) {
 					t.Fatal("expected panic for invalid arguments")
 				}
 			}()
-			NewFixedWindowCounter(tt.limit, tt.window)
+			algorithms.NewFixedWindowCounter(tt.limit, tt.window)
 		})
 	}
 }
