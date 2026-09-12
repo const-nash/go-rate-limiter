@@ -147,6 +147,47 @@ one interprets "rate" in its own shape — `rate+burst` vs
 algorithm-specific parameter — those stay owned by the concrete
 algorithm.
 
+## Package layout
+
+Concrete algorithms live in their own package, `algorithms`, separate
+from the root `ratelimit` package that defines `Algorithm`, `Result`,
+`Limiter`, and `Clock`:
+
+```mermaid
+flowchart TB
+    subgraph root["ratelimit (root package)"]
+        Algorithm
+        Result
+        Limiter
+        Clock
+        SystemClock
+    end
+    subgraph algs["ratelimit/algorithms"]
+        FixedWindowCounter
+        TokenBucket
+        LeakyBucket
+        SlidingWindowLog
+    end
+    subgraph iv["ratelimit/internal/validate"]
+        validate
+    end
+    algs -->|imports for Algorithm, Result| root
+    algs -->|imports| iv
+```
+
+`algorithms` imports `ratelimit` to implement `Algorithm` and return
+`Result`; `ratelimit` never imports `algorithms` back, so there's no
+import cycle — this is the same shape as `image` and `image/png` in
+the standard library, or `hash` and `crypto/sha256`. It also keeps
+the Strategy pattern honest: `Limiter` depends only on the
+`Algorithm` interface, never on a concrete type, so nothing stops a
+caller from implementing `Algorithm` outside this module entirely.
+
+`internal/validate` stays a separate, unexported package rather than
+living inside `algorithms`, since it's shared infrastructure that any
+future algorithm package — inside or outside `algorithms` — should be
+able to call without depending on unrelated algorithm code.
+
 ## Usage flow
 
 The client picks and creates a concrete algorithm implementation,
@@ -157,8 +198,8 @@ algorithm, and returns the `Result` the algorithm computed.
 
 ```mermaid
 flowchart LR
-    A["client code"] -->|"NewTokenBucket(rate, burst)"| B["TokenBucket\n(Algorithm)"]
-    A -->|"New(algorithm, clock)"| C["Limiter"]
+    A["client code"] -->|"algorithms.NewTokenBucket(rate, burst)"| B["TokenBucket\n(Algorithm)"]
+    A -->|"ratelimit.New(algorithm, clock)"| C["Limiter"]
     A -->|"SystemClock{}"| E["Clock"]
     B -.->|"passed in as\nAlgorithm"| C
     E -.->|"passed in as\nClock"| C
@@ -172,17 +213,19 @@ flowchart LR
 
 To add a new rate-limiting algorithm:
 
-1. Create a struct holding its own internal state (counters,
-   timestamps, a mutex for concurrent access). It does not need a
-   `Clock` field — time is received per call, not stored.
-2. Implement `Allow(now time.Time) Result` and
-   `AllowN(now time.Time, n int) Result` on it, satisfying the
-   `Algorithm` interface. Fill in whichever `Result` fields the
-   algorithm can meaningfully compute from its own state (at least
-   `Allowed`; typically `RetryAfter` and `Remaining` too).
-3. Validate its constructor arguments using the shared `validate`
-   helpers.
+1. Create a struct in the `algorithms` package holding its own
+   internal state (counters, timestamps, a mutex for concurrent
+   access). It does not need a `Clock` field — time is received per
+   call, not stored.
+2. Implement `Allow(now time.Time) ratelimit.Result` and
+   `AllowN(now time.Time, n int) ratelimit.Result` on it, satisfying
+   the `ratelimit.Algorithm` interface. Fill in whichever `Result`
+   fields the algorithm can meaningfully compute from its own state
+   (at least `Allowed`; typically `RetryAfter` and `Remaining` too).
+3. Validate its constructor arguments using the shared
+   `internal/validate` helpers.
 4. Pass an instance of the new struct, together with a `Clock`
-   (typically `SystemClock`), into `ratelimit.New(algorithm, clock)`.
+   (typically `ratelimit.SystemClock`), into
+   `ratelimit.New(algorithm, clock)`.
 
-`Limiter` and the rest of the library remain unchanged.
+`Limiter` and the rest of the root package remain unchanged.
