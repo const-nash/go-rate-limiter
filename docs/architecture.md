@@ -13,20 +13,36 @@ reads `now` once per call and passes it explicitly into the
 algorithm's methods, so every `Algorithm` implementation is a pure
 function of `now` — it never reads the wall clock itself.
 
+`Allow`/`AllowN` return a `Result` rather than a plain `bool`. A bare
+boolean can't tell a caller how long to wait before retrying or how
+much quota is left, which is what a production caller (an HTTP
+handler returning `429` with a `Retry-After` header, a client doing
+backoff) actually needs. `Result` carries `Allowed` plus the detail
+each concrete algorithm can compute from its own state: `Remaining`,
+`RetryAfter`, `ResetAt`, and `Limit`.
+
 ```mermaid
 classDiagram
     class Algorithm {
         <<interface>>
-        +Allow(now time.Time) bool
-        +AllowN(now time.Time, n int) bool
+        +Allow(now time.Time) Result
+        +AllowN(now time.Time, n int) Result
+    }
+
+    class Result {
+        +Allowed bool
+        +Remaining int
+        +RetryAfter time.Duration
+        +ResetAt time.Time
+        +Limit int
     }
 
     class Limiter {
         -algorithm Algorithm
         -clock Clock
         +New(algorithm Algorithm, clock Clock) *Limiter
-        +Allow() bool
-        +AllowN(n int) bool
+        +Allow() Result
+        +AllowN(n int) Result
     }
 
     class Clock {
@@ -51,8 +67,8 @@ classDiagram
         -lastRefill time.Time
         -mu sync.Mutex
         +NewTokenBucket(rate float64, burst int) *TokenBucket
-        +Allow(now time.Time) bool
-        +AllowN(now time.Time, n int) bool
+        +Allow(now time.Time) Result
+        +AllowN(now time.Time, n int) Result
     }
 
     class LeakyBucket {
@@ -62,8 +78,8 @@ classDiagram
         -lastLeak time.Time
         -mu sync.Mutex
         +NewLeakyBucket(rate float64, capacity int) *LeakyBucket
-        +Allow(now time.Time) bool
-        +AllowN(now time.Time, n int) bool
+        +Allow(now time.Time) Result
+        +AllowN(now time.Time, n int) Result
     }
 
     class FixedWindowCounter {
@@ -73,8 +89,8 @@ classDiagram
         -windowStart time.Time
         -mu sync.Mutex
         +NewFixedWindowCounter(limit int, window time.Duration) *FixedWindowCounter
-        +Allow(now time.Time) bool
-        +AllowN(now time.Time, n int) bool
+        +Allow(now time.Time) Result
+        +AllowN(now time.Time, n int) Result
     }
 
     class SlidingWindowLog {
@@ -83,11 +99,12 @@ classDiagram
         -timestamps []time.Time
         -mu sync.Mutex
         +NewSlidingWindowLog(limit int, window time.Duration) *SlidingWindowLog
-        +Allow(now time.Time) bool
-        +AllowN(now time.Time, n int) bool
+        +Allow(now time.Time) Result
+        +AllowN(now time.Time, n int) Result
     }
 
     Limiter o-- Algorithm : holds (composition)
+    Algorithm ..> Result : returns
     Limiter o-- Clock : holds (composition)
     Algorithm <|.. TokenBucket : implements
     Algorithm <|.. LeakyBucket : implements
@@ -135,8 +152,8 @@ algorithm.
 The client picks and creates a concrete algorithm implementation,
 then passes it — together with a `Clock` — into `Limiter` via `New`.
 From that point on, the client only calls `Limiter.Allow()`;
-`Limiter` reads the current time itself and forwards it into the
-algorithm.
+`Limiter` reads the current time itself, forwards it into the
+algorithm, and returns the `Result` the algorithm computed.
 
 ```mermaid
 flowchart LR
@@ -147,6 +164,8 @@ flowchart LR
     E -.->|"passed in as\nClock"| C
     C -->|"now := clock.Now()"| E
     C -->|"algorithm.Allow(now)"| B
+    B -->|"Result{Allowed, RetryAfter, ...}"| C
+    C -->|"Result"| A
 ```
 
 ## Extending with a new algorithm
@@ -156,9 +175,11 @@ To add a new rate-limiting algorithm:
 1. Create a struct holding its own internal state (counters,
    timestamps, a mutex for concurrent access). It does not need a
    `Clock` field — time is received per call, not stored.
-2. Implement `Allow(now time.Time) bool` and
-   `AllowN(now time.Time, n int) bool` on it, satisfying the
-   `Algorithm` interface.
+2. Implement `Allow(now time.Time) Result` and
+   `AllowN(now time.Time, n int) Result` on it, satisfying the
+   `Algorithm` interface. Fill in whichever `Result` fields the
+   algorithm can meaningfully compute from its own state (at least
+   `Allowed`; typically `RetryAfter` and `Remaining` too).
 3. Validate its constructor arguments using the shared `validate`
    helpers.
 4. Pass an instance of the new struct, together with a `Clock`

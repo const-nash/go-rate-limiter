@@ -12,10 +12,10 @@ func New(algorithm Algorithm, clock Clock) *Limiter {
 	}
 }
 
-func (l *Limiter) Allow() bool {
+func (l *Limiter) Allow() Result {
 	return l.algorithm.Allow(l.clock.Now())
 }
 
-func (l *Limiter) AllowN(n int) bool {
+func (l *Limiter) AllowN(n int) Result {
 	return l.algorithm.AllowN(l.clock.Now(), n)
 }
