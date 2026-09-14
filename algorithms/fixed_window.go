@@ -116,7 +116,8 @@ func (f *FixedWindowCounter) loadState(ctx context.Context, key string) (fixedWi
 // the key's first request, so window boundaries are deterministic
 // regardless of when a given key happens to make its first call.
 func (f *FixedWindowCounter) advance(state *fixedWindowState, now time.Time) {
-	if now.Before(state.windowStart.Add(f.window)) {
+	windowEnd := state.windowStart.Add(f.window)
+	if now.Before(windowEnd) {
 		return
 	}
 	state.windowStart = now.Truncate(f.window)

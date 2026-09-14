@@ -39,23 +39,23 @@ func NewMapStore() *MapStore {
 	return &MapStore{items: make(map[string]any)}
 }
 
-func (r *MapStore) Get(_ context.Context, key string) (any, bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	value, ok := r.items[key]
+func (s *MapStore) Get(_ context.Context, key string) (any, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.items[key]
 	return value, ok, nil
 }
 
-func (r *MapStore) Set(_ context.Context, key string, value any) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.items[key] = value
+func (s *MapStore) Set(_ context.Context, key string, value any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.items[key] = value
 	return nil
 }
 
-func (r *MapStore) Delete(_ context.Context, key string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.items, key)
+func (s *MapStore) Delete(_ context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.items, key)
 	return nil
 }
