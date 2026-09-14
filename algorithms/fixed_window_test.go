@@ -1,24 +1,33 @@
 package algorithms_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	ratelimit "github.com/const-nash/go-rate-limiter"
 	"github.com/const-nash/go-rate-limiter/algorithms"
 )
 
 func TestFixedWindowCounter_AllowsUpToLimit(t *testing.T) {
-	fw := algorithms.NewFixedWindowCounter(3, time.Minute)
+	ctx := context.Background()
+	fw := algorithms.NewFixedWindowCounter(3, time.Minute, ratelimit.NewMapStore())
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 3; i++ {
-		res := fw.Allow(now)
+		res, err := fw.Allow(ctx, now, "u1")
+		if err != nil {
+			t.Fatalf("request %d: unexpected error: %v", i, err)
+		}
 		if !res.Allowed {
 			t.Fatalf("request %d: expected allowed, got denied", i)
 		}
 	}
 
-	res := fw.Allow(now)
+	res, err := fw.Allow(ctx, now, "u1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if res.Allowed {
 		t.Fatal("expected 4th request within the same window to be denied")
 	}
@@ -28,34 +37,50 @@ func TestFixedWindowCounter_AllowsUpToLimit(t *testing.T) {
 }
 
 func TestFixedWindowCounter_ResetsAfterWindowElapses(t *testing.T) {
-	fw := algorithms.NewFixedWindowCounter(1, time.Minute)
+	ctx := context.Background()
+	fw := algorithms.NewFixedWindowCounter(1, time.Minute, ratelimit.NewMapStore())
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	res := fw.Allow(now)
+	res, err := fw.Allow(ctx, now, "u1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if !res.Allowed {
 		t.Fatal("expected first request to be allowed")
 	}
 
-	if res := fw.Allow(now.Add(30 * time.Second)); res.Allowed {
+	if res, err := fw.Allow(ctx, now.Add(30*time.Second), "u1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if res.Allowed {
 		t.Fatal("expected second request within the same window to be denied")
 	}
 
-	res = fw.Allow(now.Add(time.Minute))
+	res, err = fw.Allow(ctx, now.Add(time.Minute), "u1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if !res.Allowed {
 		t.Fatal("expected request in the next window to be allowed")
 	}
 }
 
 func TestFixedWindowCounter_AllowN(t *testing.T) {
-	fw := algorithms.NewFixedWindowCounter(10, time.Minute)
+	ctx := context.Background()
+	fw := algorithms.NewFixedWindowCounter(10, time.Minute, ratelimit.NewMapStore())
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	res := fw.AllowN(now, 7)
+	res, err := fw.AllowN(ctx, now, "u1", 7)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if !res.Allowed || res.Remaining != 3 {
 		t.Fatalf("expected allowed with 3 remaining, got allowed=%v remaining=%d", res.Allowed, res.Remaining)
 	}
 
-	res = fw.AllowN(now, 4)
+	res, err = fw.AllowN(ctx, now, "u1", 4)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if res.Allowed {
 		t.Fatal("expected request exceeding remaining quota to be denied")
 	}
@@ -65,11 +90,17 @@ func TestFixedWindowCounter_AllowN(t *testing.T) {
 }
 
 func TestFixedWindowCounter_RetryAfterAndResetAt(t *testing.T) {
-	fw := algorithms.NewFixedWindowCounter(1, time.Minute)
+	ctx := context.Background()
+	fw := algorithms.NewFixedWindowCounter(1, time.Minute, ratelimit.NewMapStore())
 	now := time.Date(2026, 1, 1, 0, 0, 30, 0, time.UTC)
 
-	fw.Allow(now)
-	res := fw.Allow(now)
+	if _, err := fw.Allow(ctx, now, "u1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	res, err := fw.Allow(ctx, now, "u1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	wantResetAt := now.Truncate(time.Minute).Add(time.Minute)
 	if !res.ResetAt.Equal(wantResetAt) {
@@ -79,6 +110,29 @@ func TestFixedWindowCounter_RetryAfterAndResetAt(t *testing.T) {
 	wantRetryAfter := wantResetAt.Sub(now)
 	if res.RetryAfter != wantRetryAfter {
 		t.Fatalf("expected RetryAfter %v, got %v", wantRetryAfter, res.RetryAfter)
+	}
+}
+
+func TestFixedWindowCounter_IsolatesKeys(t *testing.T) {
+	ctx := context.Background()
+	fw := algorithms.NewFixedWindowCounter(1, time.Minute, ratelimit.NewMapStore())
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	if res, err := fw.Allow(ctx, now, "u1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if !res.Allowed {
+		t.Fatal("expected first request for u1 to be allowed")
+	}
+	if res, err := fw.Allow(ctx, now, "u1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if res.Allowed {
+		t.Fatal("expected second request for u1 to be denied")
+	}
+
+	if res, err := fw.Allow(ctx, now, "u2"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if !res.Allowed {
+		t.Fatal("expected u2's own quota to be unaffected by u1's usage")
 	}
 }
 
@@ -101,7 +155,7 @@ func TestFixedWindowCounter_InvalidArgsPanic(t *testing.T) {
 					t.Fatal("expected panic for invalid arguments")
 				}
 			}()
-			algorithms.NewFixedWindowCounter(tt.limit, tt.window)
+			algorithms.NewFixedWindowCounter(tt.limit, tt.window, ratelimit.NewMapStore())
 		})
 	}
 }
