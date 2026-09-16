@@ -2,12 +2,23 @@ package algorithms
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	ratelimit "github.com/const-nash/go-rate-limiter"
 	"github.com/const-nash/go-rate-limiter/internal/validate"
 )
+
+// SlidingWindowState is the state SlidingWindowLog keeps for one key:
+// the timestamp of every request still inside the trailing window,
+// oldest first.
+//
+// Its field is deliberately unexported: the type is exported only so
+// a caller can name it when building the store that holds it
+// (ratelimit.NewMapStore[algorithms.SlidingWindowState]()). Its zero
+// value is a key that has not been seen yet.
+type SlidingWindowState struct {
+	timestamps []time.Time
+}
 
 // SlidingWindowLog allows up to limit requests within any trailing
 // window of the given duration, tracked independently per key. Unlike
@@ -17,20 +28,19 @@ import (
 // rest. That gives an exact sliding window — no boundary burst — at
 // the cost of O(limit) memory per key instead of FixedWindowCounter's
 // O(1).
+//
+// It holds no lock of its own: read-modify-write for one key happens
+// inside a single store.Update, so whatever the KeyStore uses to make
+// that atomic (MapStore takes one shard lock) is the only
+// serialization, and keys that don't collide there proceed in
+// parallel.
 type SlidingWindowLog struct {
 	limit  int
 	window time.Duration
-	store  ratelimit.KeyStore
-	// mu serializes AllowN across every key on this instance, not just
-	// the key being updated — simple and correct, at the cost of keys
-	// contending with each other under concurrent traffic. That cost
-	// grows sharply if store is backed by a network service, since
-	// the whole critical section (including the round trip) runs
-	// while mu is held.
-	mu sync.Mutex
+	store  ratelimit.KeyStore[SlidingWindowState]
 }
 
-func NewSlidingWindowLog(limit int, window time.Duration, store ratelimit.KeyStore) *SlidingWindowLog {
+func NewSlidingWindowLog(limit int, window time.Duration, store ratelimit.KeyStore[SlidingWindowState]) *SlidingWindowLog {
 	if err := validate.Limit(limit); err != nil {
 		panic(err)
 	}
@@ -50,56 +60,31 @@ func (s *SlidingWindowLog) Allow(ctx context.Context, now time.Time, key string)
 }
 
 func (s *SlidingWindowLog) AllowN(ctx context.Context, now time.Time, key string, n int) (ratelimit.Result, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.store.Update(ctx, key, func(state SlidingWindowState, _ bool) (SlidingWindowState, ratelimit.Result, error) {
+		state.timestamps = s.evict(state.timestamps, now)
 
-	loaded, err := s.loadTimestamps(ctx, key)
-	if err != nil {
-		return ratelimit.Result{}, err
-	}
-	timestamps := s.evict(loaded, now)
-
-	if len(timestamps)+n > s.limit {
-		if err := s.store.Set(ctx, key, timestamps); err != nil {
-			return ratelimit.Result{}, err
+		if len(state.timestamps)+n > s.limit {
+			resetAt := s.resetAt(state.timestamps, now)
+			// Still written back: evict may have dropped aged-out entries.
+			return state, ratelimit.Result{
+				Allowed:    false,
+				Remaining:  s.limit - len(state.timestamps),
+				RetryAfter: resetAt.Sub(now),
+				ResetAt:    resetAt,
+				Limit:      s.limit,
+			}, nil
 		}
-		return ratelimit.Result{
-			Allowed:    false,
-			Remaining:  s.limit - len(timestamps),
-			RetryAfter: s.resetAt(timestamps, now).Sub(now),
-			ResetAt:    s.resetAt(timestamps, now),
-			Limit:      s.limit,
+
+		for i := 0; i < n; i++ {
+			state.timestamps = append(state.timestamps, now)
+		}
+		return state, ratelimit.Result{
+			Allowed:   true,
+			Remaining: s.limit - len(state.timestamps),
+			ResetAt:   s.resetAt(state.timestamps, now),
+			Limit:     s.limit,
 		}, nil
-	}
-
-	for i := 0; i < n; i++ {
-		timestamps = append(timestamps, now)
-	}
-	if err := s.store.Set(ctx, key, timestamps); err != nil {
-		return ratelimit.Result{}, err
-	}
-
-	return ratelimit.Result{
-		Allowed:   true,
-		Remaining: s.limit - len(timestamps),
-		ResetAt:   s.resetAt(timestamps, now),
-		Limit:     s.limit,
-	}, nil
-}
-
-func (s *SlidingWindowLog) loadTimestamps(ctx context.Context, key string) ([]time.Time, error) {
-	raw, ok, err := s.store.Get(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, nil
-	}
-	timestamps, ok := raw.([]time.Time)
-	if !ok {
-		return nil, nil
-	}
-	return timestamps, nil
+	})
 }
 
 // evict drops every timestamp that has aged out of the trailing

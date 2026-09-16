@@ -66,20 +66,28 @@ classDiagram
         +Now() time.Time
     }
 
-    class KeyStore {
+    class KeyStore~T~ {
         <<interface>>
-        +Get(ctx Context, key string) (any, bool, error)
-        +Set(ctx Context, key string, value any) error
+        +Update(ctx Context, key string, fn UpdateFunc~T~) (Result, error)
         +Delete(ctx Context, key string) error
     }
 
-    class MapStore {
-        -items map[string]any
-        -mu sync.Mutex
-        +NewMapStore() *MapStore
-        +Get(ctx Context, key string) (any, bool, error)
-        +Set(ctx Context, key string, value any) error
+    class UpdateFunc~T~ {
+        <<function>>
+        +func(prev T, ok bool) (next T, out Result, err error)
+    }
+
+    class MapStore~T~ {
+        -seed maphash.Seed
+        -shards []mapShard~T~
+        +NewMapStore~T~() *MapStore~T~
+        +Update(ctx Context, key string, fn UpdateFunc~T~) (Result, error)
         +Delete(ctx Context, key string) error
+    }
+
+    class mapShard~T~ {
+        -mu sync.Mutex
+        -items map[string]T
     }
 
     class validate {
@@ -91,9 +99,8 @@ classDiagram
     class TokenBucket {
         -rate float64
         -burst int
-        -store KeyStore
-        -mu sync.Mutex
-        +NewTokenBucket(rate float64, burst int, store KeyStore) *TokenBucket
+        -store KeyStore~TokenBucketState~
+        +NewTokenBucket(rate float64, burst int, store KeyStore~TokenBucketState~) *TokenBucket
         +Allow(ctx Context, now time.Time, key string) (Result, error)
         +AllowN(ctx Context, now time.Time, key string, n int) (Result, error)
     }
@@ -101,9 +108,8 @@ classDiagram
     class LeakyBucket {
         -rate float64
         -capacity int
-        -store KeyStore
-        -mu sync.Mutex
-        +NewLeakyBucket(rate float64, capacity int, store KeyStore) *LeakyBucket
+        -store KeyStore~LeakyBucketState~
+        +NewLeakyBucket(rate float64, capacity int, store KeyStore~LeakyBucketState~) *LeakyBucket
         +Allow(ctx Context, now time.Time, key string) (Result, error)
         +AllowN(ctx Context, now time.Time, key string, n int) (Result, error)
     }
@@ -111,9 +117,8 @@ classDiagram
     class FixedWindowCounter {
         -limit int
         -window time.Duration
-        -store KeyStore
-        -mu sync.Mutex
-        +NewFixedWindowCounter(limit int, window time.Duration, store KeyStore) *FixedWindowCounter
+        -store KeyStore~FixedWindowState~
+        +NewFixedWindowCounter(limit int, window time.Duration, store KeyStore~FixedWindowState~) *FixedWindowCounter
         +Allow(ctx Context, now time.Time, key string) (Result, error)
         +AllowN(ctx Context, now time.Time, key string, n int) (Result, error)
     }
@@ -121,9 +126,8 @@ classDiagram
     class SlidingWindowLog {
         -limit int
         -window time.Duration
-        -store KeyStore
-        -mu sync.Mutex
-        +NewSlidingWindowLog(limit int, window time.Duration, store KeyStore) *SlidingWindowLog
+        -store KeyStore~SlidingWindowState~
+        +NewSlidingWindowLog(limit int, window time.Duration, store KeyStore~SlidingWindowState~) *SlidingWindowLog
         +Allow(ctx Context, now time.Time, key string) (Result, error)
         +AllowN(ctx Context, now time.Time, key string, n int) (Result, error)
     }
@@ -173,26 +177,41 @@ one interprets "rate" in its own shape — `rate+burst` vs
   `window <= 0`, etc.). This avoids duplicating the same validation
   logic in every constructor without coupling the algorithms to each
   other or to `Limiter`.
-- **`KeyStore`** — where a concrete algorithm keeps its per-key
-  state (`Get`/`Set`/`Delete`, keyed by a plain `string`). Each
-  algorithm still owns the *shape* of its own state (`FixedWindowCounter`
+- **`KeyStore[T]`** — where a concrete algorithm keeps its per-key
+  state (`Update`/`Delete`, keyed by a plain `string`). Each
+  algorithm owns the *shape* of its own state (`FixedWindowCounter`
   needs `{count, windowStart}`, `SlidingWindowLog` needs
-  `[]time.Time`, ...) and stores it as an `any` value; the store
-  only needs to hand it back unchanged. A `KeyStore` is passed into
-  an algorithm's constructor (`NewFixedWindowCounter(limit, window,
-  store)`), not owned by `Limiter` — only the algorithm knows the
-  shape of the state it needs, so `Limiter` stays algorithm-agnostic
-  and never has to know about keys or stores at all.
+  `[]time.Time`, ...) and the store is parameterized on it, so the
+  state is stored as its own type rather than as an `any`. A
+  `KeyStore[T]` is passed into an algorithm's constructor
+  (`NewFixedWindowCounter(limit, window, store)`), not owned by
+  `Limiter` — only the algorithm knows the shape of the state it
+  needs, so `Limiter` stays algorithm-agnostic and never has to know
+  about keys or stores at all.
 
   Design choices worth calling out:
-  - The key is a plain `string`, not a generic type parameter. A
-    caller with a `uuid.UUID`, an `int`, or any other identifier
-    serializes it to a string themselves (`id.String()`,
+  - The *key* is a plain `string`, even though the *value* is a type
+    parameter. A caller with a `uuid.UUID`, an `int`, or any other
+    identifier serializes it to a string themselves (`id.String()`,
     `strconv.Itoa(n)`, ...) before calling `Allow`/`AllowN`. This keeps
-    `Algorithm`, `Limiter`, and `KeyStore` free of type parameters,
-    and avoids picking a constraint that would work for an in-memory
+    `Algorithm` and `Limiter` free of type parameters entirely, and
+    avoids picking a key constraint that would work for an in-memory
     map but not for a future backend (Redis, ...) whose keys are
     strings anyway.
+  - The *value* is a type parameter, `T`, rather than an `any`. Two
+    reasons, one per axis. Correctness: handing one algorithm's store
+    to another is now a compile error, where before the receiving
+    algorithm's type assertion would quietly fail and read the key as
+    having no state — silently resetting its quota at run time.
+    Cost: an `any` heap-allocates every state larger than a word on
+    every single write, so the old design burned one allocation per
+    request purely on boxing.
+  - Each algorithm's state type is *exported* (`FixedWindowState`,
+    `SlidingWindowState`, ...) but its fields are not. The name has to
+    be reachable so a caller can instantiate the store that holds it
+    (`ratelimit.NewMapStore[algorithms.FixedWindowState]()`); the
+    fields stay private so the state remains the algorithm's own
+    business, and its zero value means "key not seen yet".
   - Every `KeyStore` method takes a `context.Context` and returns
     an `error`, even though `MapStore` ignores the former and never
     produces the latter. Go has no `async`/`await`: a network-backed
@@ -207,18 +226,38 @@ one interprets "rate" in its own shape — `rate+burst` vs
     reason — a rate-limiting decision that silently treated "Redis
     timed out" as "key has no state" would reset every caller's quota
     on every store blip.
-  - `MapStore` guards its own map with a mutex, but each algorithm
-    additionally serializes its own `AllowN` with a single `mu`
-    covering every key, not just the one being read — the read
-    (`Get`), decide, and write (`Set`) has to happen atomically to
-    avoid a lost update from two concurrent calls for the same key.
-    For `MapStore` this costs unrelated keys some contention on one
-    lock. For a network-backed store the same lock is held across
-    the round trip too, which turns the whole algorithm instance into
-    a single in-flight request at a time — a real bottleneck, not just
-    a theoretical one. If that happens, a future revision could shard
-    the lock or push per-key locking into `KeyStore` itself,
-    without changing `Algorithm`'s signature again.
+  - Read-modify-write is **one** store operation, `Update`, not a
+    `Get` followed by a `Set`. Reading a key's state, deciding, and
+    writing the result has to be atomic, or two concurrent calls for
+    one key lose an update. With `Get`/`Set` the only place to enforce
+    that is *outside* the store, which in practice meant one
+    `sync.Mutex` per algorithm instance covering every key — correct,
+    but it serialized keys that never touch each other, and for a
+    network-backed store it held that lock across the round trip,
+    reducing the whole instance to one in-flight request at a time.
+    Worse, across two processes sharing one Redis it wasn't even
+    correct: each process guards only its own gap.
+    Folding it into `Update` lets each store make it atomic its own
+    way — `MapStore` takes a single shard lock, a Redis store would
+    use a script or an optimistic retry — and **no algorithm holds a
+    lock of its own any more.**
+  - `MapStore` spreads keys over independently locked shards rather
+    than guarding one map with one mutex, so calls for different keys
+    normally proceed in parallel. The shard count is a power of two,
+    which makes shard selection a mask over the key's hash; each
+    shard is padded to its own cache line so that locking one shard
+    doesn't invalidate a neighbour's.
+  - `UpdateFunc` returns the `Result` instead of assigning it to a
+    captured variable, and `Update` passes it back. This looks like a
+    detail and is not: a `Result` captured by a closure escapes to
+    the heap on every call. The one allocation that remains per
+    request is the closure itself, which is unavoidable while
+    `KeyStore` is an interface — the price of being able to swap in a
+    distributed backend.
+  - An `UpdateFunc` runs while the store holds the lock or
+    transaction guarding the key, so it must not block: no I/O, no
+    reentrant store calls. A network-backed store may also retry it
+    on conflict, so it must be a pure function of its arguments.
   - There is no key eviction yet — a key, once seen, keeps its entry
     in the store forever. Fine for now (the library has no users
     yet), but a longer-lived process with a growing set of keys will
@@ -274,7 +313,8 @@ able to call without depending on unrelated algorithm code.
 ## Usage flow
 
 The client picks and creates a concrete algorithm implementation
-(passing it a `KeyStore`, typically `ratelimit.NewMapStore()`),
+(passing it a `KeyStore[T]` for that algorithm's own state type,
+typically `ratelimit.NewMapStore[algorithms.FixedWindowState]()`),
 then passes the algorithm — together with a `Clock` — into `Limiter`
 via `New`. From that point on, the client calls
 `Limiter.Allow(ctx, key)` with a `context.Context` (for cancellation,
@@ -289,7 +329,7 @@ flowchart LR
     A["client code"] -->|"algorithms.NewTokenBucket(rate, burst, store)"| B["TokenBucket\n(Algorithm)"]
     A -->|"ratelimit.New(algorithm, clock)"| C["Limiter"]
     A -->|"SystemClock{}"| E["Clock"]
-    A -->|"ratelimit.NewMapStore()"| R["MapStore\n(KeyStore)"]
+    A -->|"ratelimit.NewMapStore[TokenBucketState]()"| R["MapStore[T]\n(KeyStore[T])"]
     R -.->|"passed in as\nKeyStore"| B
     B -.->|"passed in as\nAlgorithm"| C
     E -.->|"passed in as\nClock"| C
@@ -303,35 +343,40 @@ flowchart LR
 
 To add a new rate-limiting algorithm:
 
-1. Define a private state type for whatever one key needs to remember
-   between calls (a struct of counters/timestamps, a slice, ...), and
-   a struct for the algorithm itself holding its config (`limit`,
-   `window`, ...), a `ratelimit.KeyStore`, and a `mu sync.Mutex`. It
-   does not need a `Clock` field — time is received per call, not
-   stored — and it does not store per-key state as its own fields;
-   that lives in the store, addressed by key.
+1. Define a state type for whatever one key needs to remember between
+   calls (a struct of counters/timestamps, a slice, ...). Export the
+   type name but keep its fields unexported, and make its zero value
+   mean "key not seen yet". Then define a struct for the algorithm
+   itself holding its config (`limit`, `window`, ...) and a
+   `ratelimit.KeyStore[YourState]`. It does **not** need a mutex —
+   atomicity is the store's job — it does not need a `Clock` field
+   (time is received per call), and it does not store per-key state
+   as its own fields; that lives in the store, addressed by key.
 2. Implement `Allow(ctx context.Context, now time.Time, key string)
    (ratelimit.Result, error)` and `AllowN(ctx context.Context, now
    time.Time, key string, n int) (ratelimit.Result, error)`,
-   satisfying the `ratelimit.Algorithm` interface. Each call should:
-   lock `mu`, load the key's state from the store, passing `ctx`
-   through (a zero value if absent — but return immediately with a
-   zero `Result` and the error if `Get` itself failed, don't treat a
-   store error as "absent"), compute the decision, `Set` the
-   (possibly updated) state back, again propagating `ctx` and
-   returning immediately on error — even on denial, since the state
-   may still have changed (e.g. a window rolling over) — and unlock.
-   Fill in whichever `Result` fields the algorithm can meaningfully
-   compute (at least `Allowed`; typically `RetryAfter` and `Remaining`
-   too).
+   satisfying the `ratelimit.Algorithm` interface. `AllowN` should be
+   a single `store.Update` call whose `UpdateFunc` computes the next
+   state and the `Result` together and returns both; `Allow` is
+   `AllowN(..., 1)`. Return the state even when denying the request,
+   since it may still have changed (a window rolling over, entries
+   aging out). Fill in whichever `Result` fields the algorithm can
+   meaningfully compute (at least `Allowed`; typically `RetryAfter`
+   and `Remaining` too).
+
+   Inside the `UpdateFunc`: use the `ok` argument if "no state yet"
+   differs from your zero value (a token bucket starts a new key at
+   full burst, not at zero tokens); do no I/O and take no locks, and
+   assume it may be called more than once for one `Update` if the
+   store retries.
 3. Validate its constructor arguments using the shared
    `internal/validate` helpers.
-4. Have the constructor accept a `ratelimit.KeyStore` parameter
-   (the caller decides the backend — `ratelimit.NewMapStore()` for
-   in-memory, or a custom implementation for something distributed).
-   Pass an instance of the new struct, together with a `Clock`
-   (typically `ratelimit.SystemClock`), into
-   `ratelimit.New(algorithm, clock)`.
+4. Have the constructor accept a `ratelimit.KeyStore[YourState]`
+   parameter (the caller decides the backend —
+   `ratelimit.NewMapStore[YourState]()` for in-memory, or a custom
+   implementation for something distributed). Pass an instance of the
+   new struct, together with a `Clock` (typically
+   `ratelimit.SystemClock`), into `ratelimit.New(algorithm, clock)`.
 
 `Limiter` and the rest of the root package remain unchanged — they
 know nothing about keys or stores beyond the `Algorithm` and

@@ -11,7 +11,7 @@ import (
 
 func TestSlidingWindowLog_AllowsUpToLimit(t *testing.T) {
 	ctx := context.Background()
-	sw := algorithms.NewSlidingWindowLog(3, time.Minute, ratelimit.NewMapStore())
+	sw := algorithms.NewSlidingWindowLog(3, time.Minute, ratelimit.NewMapStore[algorithms.SlidingWindowState]())
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 3; i++ {
@@ -38,7 +38,7 @@ func TestSlidingWindowLog_AllowsUpToLimit(t *testing.T) {
 
 func TestSlidingWindowLog_SlidesGradually(t *testing.T) {
 	ctx := context.Background()
-	sw := algorithms.NewSlidingWindowLog(2, time.Minute, ratelimit.NewMapStore())
+	sw := algorithms.NewSlidingWindowLog(2, time.Minute, ratelimit.NewMapStore[algorithms.SlidingWindowState]())
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	if res, err := sw.Allow(ctx, base, "u1"); err != nil {
@@ -76,7 +76,7 @@ func TestSlidingWindowLog_SlidesGradually(t *testing.T) {
 
 func TestSlidingWindowLog_AllowN(t *testing.T) {
 	ctx := context.Background()
-	sw := algorithms.NewSlidingWindowLog(10, time.Minute, ratelimit.NewMapStore())
+	sw := algorithms.NewSlidingWindowLog(10, time.Minute, ratelimit.NewMapStore[algorithms.SlidingWindowState]())
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	res, err := sw.AllowN(ctx, now, "u1", 7)
@@ -101,7 +101,7 @@ func TestSlidingWindowLog_AllowN(t *testing.T) {
 
 func TestSlidingWindowLog_RetryAfterAndResetAt(t *testing.T) {
 	ctx := context.Background()
-	sw := algorithms.NewSlidingWindowLog(1, time.Minute, ratelimit.NewMapStore())
+	sw := algorithms.NewSlidingWindowLog(1, time.Minute, ratelimit.NewMapStore[algorithms.SlidingWindowState]())
 	now := time.Date(2026, 1, 1, 0, 0, 30, 0, time.UTC)
 
 	if _, err := sw.Allow(ctx, now, "u1"); err != nil {
@@ -125,7 +125,7 @@ func TestSlidingWindowLog_RetryAfterAndResetAt(t *testing.T) {
 
 func TestSlidingWindowLog_IsolatesKeys(t *testing.T) {
 	ctx := context.Background()
-	sw := algorithms.NewSlidingWindowLog(1, time.Minute, ratelimit.NewMapStore())
+	sw := algorithms.NewSlidingWindowLog(1, time.Minute, ratelimit.NewMapStore[algorithms.SlidingWindowState]())
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	if res, err := sw.Allow(ctx, now, "u1"); err != nil {
@@ -165,7 +165,7 @@ func TestSlidingWindowLog_InvalidArgsPanic(t *testing.T) {
 					t.Fatal("expected panic for invalid arguments")
 				}
 			}()
-			algorithms.NewSlidingWindowLog(tt.limit, tt.window, ratelimit.NewMapStore())
+			algorithms.NewSlidingWindowLog(tt.limit, tt.window, ratelimit.NewMapStore[algorithms.SlidingWindowState]())
 		})
 	}
 }

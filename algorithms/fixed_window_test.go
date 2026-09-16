@@ -11,7 +11,7 @@ import (
 
 func TestFixedWindowCounter_AllowsUpToLimit(t *testing.T) {
 	ctx := context.Background()
-	fw := algorithms.NewFixedWindowCounter(3, time.Minute, ratelimit.NewMapStore())
+	fw := algorithms.NewFixedWindowCounter(3, time.Minute, ratelimit.NewMapStore[algorithms.FixedWindowState]())
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 3; i++ {
@@ -38,7 +38,7 @@ func TestFixedWindowCounter_AllowsUpToLimit(t *testing.T) {
 
 func TestFixedWindowCounter_ResetsAfterWindowElapses(t *testing.T) {
 	ctx := context.Background()
-	fw := algorithms.NewFixedWindowCounter(1, time.Minute, ratelimit.NewMapStore())
+	fw := algorithms.NewFixedWindowCounter(1, time.Minute, ratelimit.NewMapStore[algorithms.FixedWindowState]())
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	res, err := fw.Allow(ctx, now, "u1")
@@ -66,7 +66,7 @@ func TestFixedWindowCounter_ResetsAfterWindowElapses(t *testing.T) {
 
 func TestFixedWindowCounter_AllowN(t *testing.T) {
 	ctx := context.Background()
-	fw := algorithms.NewFixedWindowCounter(10, time.Minute, ratelimit.NewMapStore())
+	fw := algorithms.NewFixedWindowCounter(10, time.Minute, ratelimit.NewMapStore[algorithms.FixedWindowState]())
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	res, err := fw.AllowN(ctx, now, "u1", 7)
@@ -91,7 +91,7 @@ func TestFixedWindowCounter_AllowN(t *testing.T) {
 
 func TestFixedWindowCounter_RetryAfterAndResetAt(t *testing.T) {
 	ctx := context.Background()
-	fw := algorithms.NewFixedWindowCounter(1, time.Minute, ratelimit.NewMapStore())
+	fw := algorithms.NewFixedWindowCounter(1, time.Minute, ratelimit.NewMapStore[algorithms.FixedWindowState]())
 	now := time.Date(2026, 1, 1, 0, 0, 30, 0, time.UTC)
 
 	if _, err := fw.Allow(ctx, now, "u1"); err != nil {
@@ -115,7 +115,7 @@ func TestFixedWindowCounter_RetryAfterAndResetAt(t *testing.T) {
 
 func TestFixedWindowCounter_IsolatesKeys(t *testing.T) {
 	ctx := context.Background()
-	fw := algorithms.NewFixedWindowCounter(1, time.Minute, ratelimit.NewMapStore())
+	fw := algorithms.NewFixedWindowCounter(1, time.Minute, ratelimit.NewMapStore[algorithms.FixedWindowState]())
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	if res, err := fw.Allow(ctx, now, "u1"); err != nil {
@@ -155,7 +155,7 @@ func TestFixedWindowCounter_InvalidArgsPanic(t *testing.T) {
 					t.Fatal("expected panic for invalid arguments")
 				}
 			}()
-			algorithms.NewFixedWindowCounter(tt.limit, tt.window, ratelimit.NewMapStore())
+			algorithms.NewFixedWindowCounter(tt.limit, tt.window, ratelimit.NewMapStore[algorithms.FixedWindowState]())
 		})
 	}
 }

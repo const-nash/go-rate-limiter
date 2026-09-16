@@ -6,15 +6,19 @@ package algorithms
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	ratelimit "github.com/const-nash/go-rate-limiter"
 	"github.com/const-nash/go-rate-limiter/internal/validate"
 )
 
-// fixedWindowState is the state FixedWindowCounter keeps for one key.
-type fixedWindowState struct {
+// FixedWindowState is the state FixedWindowCounter keeps for one key.
+//
+// Its fields are deliberately unexported: the type is exported only
+// so a caller can name it when building the store that holds it
+// (ratelimit.NewMapStore[algorithms.FixedWindowState]()). Its zero
+// value is a key that has not been seen yet.
+type FixedWindowState struct {
 	count       int
 	windowStart time.Time
 }
@@ -25,20 +29,19 @@ type fixedWindowState struct {
 // the cost of allowing up to 2x limit requests across a window
 // boundary (a burst at the end of one window followed immediately by
 // a burst at the start of the next).
+//
+// It holds no lock of its own: read-modify-write for one key happens
+// inside a single store.Update, so whatever the KeyStore uses to make
+// that atomic (MapStore takes one shard lock) is the only
+// serialization, and keys that don't collide there proceed in
+// parallel.
 type FixedWindowCounter struct {
 	limit  int
 	window time.Duration
-	store  ratelimit.KeyStore
-	// mu serializes AllowN across every key on this instance, not just
-	// the key being updated — simple and correct, at the cost of keys
-	// contending with each other under concurrent traffic. That cost
-	// grows sharply if store is backed by a network service, since
-	// the whole critical section (including the round trip) runs
-	// while mu is held.
-	mu sync.Mutex
+	store  ratelimit.KeyStore[FixedWindowState]
 }
 
-func NewFixedWindowCounter(limit int, window time.Duration, store ratelimit.KeyStore) *FixedWindowCounter {
+func NewFixedWindowCounter(limit int, window time.Duration, store ratelimit.KeyStore[FixedWindowState]) *FixedWindowCounter {
 	if err := validate.Limit(limit); err != nil {
 		panic(err)
 	}
@@ -58,56 +61,29 @@ func (f *FixedWindowCounter) Allow(ctx context.Context, now time.Time, key strin
 }
 
 func (f *FixedWindowCounter) AllowN(ctx context.Context, now time.Time, key string, n int) (ratelimit.Result, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	return f.store.Update(ctx, key, func(state FixedWindowState, _ bool) (FixedWindowState, ratelimit.Result, error) {
+		f.advance(&state, now)
+		resetAt := state.windowStart.Add(f.window)
 
-	state, err := f.loadState(ctx, key)
-	if err != nil {
-		return ratelimit.Result{}, err
-	}
-
-	f.advance(&state, now)
-	resetAt := state.windowStart.Add(f.window)
-
-	if state.count+n > f.limit {
-		if err := f.store.Set(ctx, key, state); err != nil {
-			return ratelimit.Result{}, err
+		if state.count+n > f.limit {
+			// Still written back: advance may have rolled the window over.
+			return state, ratelimit.Result{
+				Allowed:    false,
+				Remaining:  f.limit - state.count,
+				RetryAfter: resetAt.Sub(now),
+				ResetAt:    resetAt,
+				Limit:      f.limit,
+			}, nil
 		}
-		return ratelimit.Result{
-			Allowed:    false,
-			Remaining:  f.limit - state.count,
-			RetryAfter: resetAt.Sub(now),
-			ResetAt:    resetAt,
-			Limit:      f.limit,
+
+		state.count += n
+		return state, ratelimit.Result{
+			Allowed:   true,
+			Remaining: f.limit - state.count,
+			ResetAt:   resetAt,
+			Limit:     f.limit,
 		}, nil
-	}
-
-	state.count += n
-	if err := f.store.Set(ctx, key, state); err != nil {
-		return ratelimit.Result{}, err
-	}
-
-	return ratelimit.Result{
-		Allowed:   true,
-		Remaining: f.limit - state.count,
-		ResetAt:   resetAt,
-		Limit:     f.limit,
-	}, nil
-}
-
-func (f *FixedWindowCounter) loadState(ctx context.Context, key string) (fixedWindowState, error) {
-	raw, ok, err := f.store.Get(ctx, key)
-	if err != nil {
-		return fixedWindowState{}, err
-	}
-	if !ok {
-		return fixedWindowState{}, nil
-	}
-	state, ok := raw.(fixedWindowState)
-	if !ok {
-		return fixedWindowState{}, nil
-	}
-	return state, nil
+	})
 }
 
 // advance rolls state.windowStart forward to the window that contains
@@ -115,7 +91,7 @@ func (f *FixedWindowCounter) loadState(ctx context.Context, key string) (fixedWi
 // Windows are aligned to absolute time (via Truncate) rather than to
 // the key's first request, so window boundaries are deterministic
 // regardless of when a given key happens to make its first call.
-func (f *FixedWindowCounter) advance(state *fixedWindowState, now time.Time) {
+func (f *FixedWindowCounter) advance(state *FixedWindowState, now time.Time) {
 	windowEnd := state.windowStart.Add(f.window)
 	if now.Before(windowEnd) {
 		return
