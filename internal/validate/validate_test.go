@@ -43,6 +43,19 @@ func TestCleanupInterval(t *testing.T) {
 	}
 }
 
+func TestShards(t *testing.T) {
+	for _, n := range []int{1, 2, 64, 1024} {
+		if err := validate.Shards(n); err != nil {
+			t.Fatalf("expected no error for %d shards, got %v", n, err)
+		}
+	}
+	for _, n := range []int{0, -1, -8, 3, 100} {
+		if err := validate.Shards(n); err == nil {
+			t.Fatalf("expected error for %d shards", n)
+		}
+	}
+}
+
 func TestLimit(t *testing.T) {
 	if err := validate.Limit(1); err != nil {
 		t.Fatalf("expected no error for positive limit, got %v", err)

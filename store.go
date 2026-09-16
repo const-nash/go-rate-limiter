@@ -95,60 +95,11 @@ type KeyStore[T any] interface {
 	Delete(ctx context.Context, key string) error
 }
 
-const (
-	// defaultShards is the number of independently locked shards a
-	// MapStore is built with. It is a power of two so a key's hash
-	// maps to a shard with a mask rather than a division, and is
-	// comfortably above GOMAXPROCS on ordinary hardware so that
-	// concurrent callers rarely land on the same shard.
-	defaultShards = 64
-
-	// shardPad is what's left of a 128-byte cache line (the line size
-	// on arm64; x86-64's 64 divides it evenly) after a shard's mutex,
-	// map header, lastNow and peak.
-	shardPad = 128 - 32
-
-	// sweepGrace is how far behind the latest known time the janitor
-	// stays when deciding what has expired. Callers read their clock
-	// before they reach the store, so a call can arrive carrying a now
-	// slightly older than one the store has already seen; the grace
-	// keeps the janitor from dropping state that such a call still
-	// needs. Update itself doesn't need it: it judges expiry by the
-	// caller's own now.
-	sweepGrace = int64(time.Second)
-
-	// A sweep rebuilds a shard's map once it holds at most
-	// 1/shrinkFactor of the entries it peaked at, provided that peak
-	// was at least shrinkMinPeak. A Go map never gives memory back on
-	// delete, so without the rebuild a burst of keys (a scan across
-	// many IPs, say) would pin its peak size for good; below
-	// shrinkMinPeak the memory at stake isn't worth the copy.
-	shrinkFactor  = 4
-	shrinkMinPeak = 1024
-)
-
-// entry is one stored state together with the instant it expires.
-type entry[T any] struct {
-	value     T
-	expiresAt int64
-}
-
-// mapShard is one independently locked slice of a MapStore's keys.
-type mapShard[T any] struct {
-	mu    sync.Mutex
-	items map[string]entry[T]
-	// lastNow is the latest now any Update on this shard was called
-	// with. The janitor measures expiry against it instead of reading
-	// a clock, so it always runs on the same clock as the callers.
-	lastNow int64
-	// peak is the largest len(items) since items was last allocated —
-	// roughly how many entries' worth of memory the map is holding.
-	peak int
-	// pad keeps each shard's mutex on its own cache line, so that a
-	// goroutine taking one shard's lock doesn't invalidate the cache
-	// line holding a neighbouring shard's lock (false sharing).
-	_ [shardPad]byte
-}
+// defaultShards is the number of independently locked shards a
+// MapStore is built with unless WithShards says otherwise. It is
+// comfortably above GOMAXPROCS on ordinary hardware, so concurrent
+// callers rarely land on the same shard.
+const defaultShards = 64
 
 // MapStore is a KeyStore backed by in-memory maps, safe for
 // concurrent use. It is the store to reach for by default; a
@@ -157,10 +108,10 @@ type mapShard[T any] struct {
 // so it ignores ctx and never returns a non-nil error of its own — it
 // returns only what an UpdateFunc returns.
 //
-// Keys are spread across independently locked shards, so calls for
-// different keys usually proceed in parallel and only calls colliding
-// on one shard wait for each other. There is deliberately no lock
-// covering the store as a whole.
+// Keys are spread across independently locked shards (64 unless set
+// WithShards), so calls for different keys usually proceed in
+// parallel and only calls colliding on one shard wait for each other.
+// There is deliberately no lock covering the store as a whole.
 //
 // An expired entry reads as absent as soon as it expires. Its memory
 // is reclaimed only if the store was built WithCleanupInterval: a
@@ -172,7 +123,7 @@ type mapShard[T any] struct {
 // may have its expired entries dropped up to one round late.
 type MapStore[T any] struct {
 	seed   maphash.Seed
-	shards []mapShard[T]
+	shards []shard[T]
 
 	// stop and done are nil unless the janitor is running.
 	stop      chan struct{}
@@ -187,7 +138,28 @@ type MapStore[T any] struct {
 type MapStoreOption func(*mapStoreConfig)
 
 type mapStoreConfig struct {
+	shards          int
 	cleanupInterval time.Duration
+}
+
+// WithShards sets how many independently locked shards the store
+// spreads its keys over; the default is 64. More shards mean calls
+// for different keys wait on each other less often, and a shorter
+// pause while the janitor sweeps a shard, since each shard holds fewer
+// keys. Each shard costs a cache line plus an empty map. Consider
+// raising it on machines with many more cores than 64, or for stores
+// holding millions of keys; lowering it only saves memory in programs
+// that create many stores.
+//
+// n must be a power of two, so that picking a key's shard is a mask
+// rather than a division; WithShards panics otherwise.
+func WithShards(n int) MapStoreOption {
+	if err := validate.Shards(n); err != nil {
+		panic(err)
+	}
+	return func(c *mapStoreConfig) {
+		c.shards = n
+	}
 }
 
 // WithCleanupInterval starts a background janitor that sweeps expired
@@ -219,17 +191,17 @@ func WithCleanupInterval(interval time.Duration) MapStoreOption {
 // long-lived process limiting on unbounded keys (per-IP, say) should
 // always set it.
 func NewMapStore[T any](opts ...MapStoreOption) *MapStore[T] {
-	var cfg mapStoreConfig
+	cfg := mapStoreConfig{shards: defaultShards}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 
 	s := &MapStore[T]{
 		seed:   maphash.MakeSeed(),
-		shards: make([]mapShard[T], defaultShards),
+		shards: make([]shard[T], cfg.shards),
 	}
 	for i := range s.shards {
-		s.shards[i].items = make(map[string]entry[T])
+		s.shards[i].init()
 	}
 
 	if cfg.cleanupInterval > 0 {
@@ -240,50 +212,18 @@ func NewMapStore[T any](opts ...MapStoreOption) *MapStore[T] {
 	return s
 }
 
-// shard picks the shard owning key. len(s.shards) is a power of two,
-// so the mask is equivalent to a modulo.
-func (s *MapStore[T]) shard(key string) *mapShard[T] {
+// shardFor picks the shard owning key. len(s.shards) is a power of
+// two, so the mask is equivalent to a modulo.
+func (s *MapStore[T]) shardFor(key string) *shard[T] {
 	return &s.shards[maphash.String(s.seed, key)&uint64(len(s.shards)-1)]
 }
 
 func (s *MapStore[T]) Update(_ context.Context, now int64, key string, fn UpdateFunc[T]) (Result, error) {
-	sh := s.shard(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-
-	if now > sh.lastNow {
-		sh.lastNow = now
-	}
-
-	var prev T
-	e, ok := sh.items[key]
-	if ok && e.expiresAt > now {
-		prev = e.value
-	} else {
-		ok = false
-	}
-
-	next, expiresAt, out, err := fn(prev, ok)
-	if err != nil {
-		return Result{}, err
-	}
-
-	if expiresAt <= now {
-		delete(sh.items, key)
-		return out, nil
-	}
-	sh.items[key] = entry[T]{value: next, expiresAt: expiresAt}
-	if n := len(sh.items); n > sh.peak {
-		sh.peak = n
-	}
-	return out, nil
+	return s.shardFor(key).update(now, key, fn)
 }
 
 func (s *MapStore[T]) Delete(_ context.Context, key string) error {
-	sh := s.shard(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	delete(sh.items, key)
+	s.shardFor(key).delete(key)
 	return nil
 }
 
@@ -334,31 +274,4 @@ func (s *MapStore[T]) sweep(stop <-chan struct{}) {
 		}
 		s.sweepNow = s.shards[i].sweep(s.sweepNow)
 	}
-}
-
-// sweep drops the shard's entries that expired by now — or by the
-// shard's own latest time, if that is later — less sweepGrace, and
-// rebuilds the map if it has shrunk well below its peak. It returns
-// the time it used, for the next shard to start from.
-func (sh *mapShard[T]) sweep(now int64) int64 {
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-
-	now = max(now, sh.lastNow)
-	cutoff := now - sweepGrace
-	for key, e := range sh.items {
-		if e.expiresAt <= cutoff {
-			delete(sh.items, key)
-		}
-	}
-
-	if live := len(sh.items); sh.peak >= shrinkMinPeak && live <= sh.peak/shrinkFactor {
-		items := make(map[string]entry[T], live)
-		for key, e := range sh.items {
-			items[key] = e
-		}
-		sh.items = items
-		sh.peak = live
-	}
-	return now
 }

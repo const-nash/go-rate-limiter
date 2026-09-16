@@ -154,7 +154,11 @@ func TestMapStore_CleanupReclaimsMemoryOfExpiredKeys(t *testing.T) {
 
 	base := heapInUse()
 	s := ratelimit.NewMapStore[counterState](ratelimit.WithCleanupInterval(time.Millisecond))
-	defer s.Close()
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("unexpected error closing the store: %v", err)
+		}
+	})
 
 	// A burst of one-shot keys, all expiring a moment later.
 	start := int64(time.Hour)
@@ -225,6 +229,45 @@ func TestMapStore_CloseWithoutJanitor(t *testing.T) {
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMapStore_WorksWithAnyValidShardCount(t *testing.T) {
+	ctx := context.Background()
+	for _, shards := range []int{1, 2, 256} {
+		t.Run(strconv.Itoa(shards), func(t *testing.T) {
+			s := ratelimit.NewMapStore[counterState](ratelimit.WithShards(shards))
+			const keys = 1000
+
+			for i := 0; i < keys; i++ {
+				if _, err := s.Update(ctx, 100, "k"+strconv.Itoa(i), set(i, 200, nil, nil)); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+			for i := 0; i < keys; i++ {
+				var prev counterState
+				var ok bool
+				if _, err := s.Update(ctx, 110, "k"+strconv.Itoa(i), set(i, 200, &prev, &ok)); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if !ok || prev.n != i {
+					t.Fatalf("key %d: expected stored n=%d, got ok=%v prev=%+v", i, i, ok, prev)
+				}
+			}
+		})
+	}
+}
+
+func TestWithShards_InvalidPanics(t *testing.T) {
+	for _, shards := range []int{0, -1, 3, 100} {
+		t.Run(strconv.Itoa(shards), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("expected panic for %d shards", shards)
+				}
+			}()
+			ratelimit.WithShards(shards)
+		})
 	}
 }
 

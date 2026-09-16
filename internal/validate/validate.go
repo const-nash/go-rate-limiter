@@ -29,6 +29,13 @@ func CleanupInterval(interval time.Duration) error {
 	return nil
 }
 
+func Shards(shards int) error {
+	if shards <= 0 || shards&(shards-1) != 0 {
+		return errors.New("ratelimit: shards must be a positive power of two")
+	}
+	return nil
+}
+
 func Limit(limit int) error {
 	if limit <= 0 {
 		return errors.New("ratelimit: limit must be positive")

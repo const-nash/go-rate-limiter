@@ -79,21 +79,26 @@ classDiagram
 
     class MapStore~T~ {
         -seed maphash.Seed
-        -shards []mapShard~T~
+        -shards []shard~T~
         -stop chan struct
         -done chan struct
         +NewMapStore~T~(opts ...MapStoreOption) *MapStore~T~
+        +WithShards(n int) MapStoreOption
         +WithCleanupInterval(interval time.Duration) MapStoreOption
         +Update(ctx Context, now int64, key string, fn UpdateFunc~T~) (Result, error)
         +Delete(ctx Context, key string) error
         +Close() error
+        -shardFor(key string) *shard~T~
     }
 
-    class mapShard~T~ {
+    class shard~T~ {
         -mu sync.Mutex
         -items map[string]entry~T~
         -lastNow int64
         -peak int
+        -update(now int64, key string, fn UpdateFunc~T~) (Result, error)
+        -delete(key string)
+        -sweep(now int64) int64
     }
 
     class entry~T~ {
@@ -107,6 +112,7 @@ classDiagram
         +Window(window time.Duration) error
         +Limit(limit int) error
         +CleanupInterval(interval time.Duration) error
+        +Shards(shards int) error
     }
 
     class TokenBucket {
@@ -155,6 +161,8 @@ classDiagram
 
     Clock <|.. SystemClock : implements
     KeyStore <|.. MapStore : implements
+    MapStore *-- shard : owns
+    shard *-- entry : stores per key
 
     TokenBucket o-- KeyStore : holds (injected)
     LeakyBucket o-- KeyStore : holds (injected)
@@ -277,14 +285,40 @@ one interprets "rate" in its own shape — `rate+burst` vs
     lock of its own any more.**
   - `MapStore` spreads keys over independently locked shards rather
     than guarding one map with one mutex, so calls for different keys
-    normally proceed in parallel. There are always 64 shards: a power
-    of two, which makes shard selection a mask over the key's hash,
-    and comfortably above `GOMAXPROCS` on ordinary hardware, so
-    concurrent callers rarely collide. The count is deliberately not
-    configurable — nothing observable through the API depends on it,
-    and a knob that exists only to be tuned in benchmarks isn't worth
-    its surface. Each shard is padded to its own cache line so that
-    locking one shard doesn't invalidate a neighbour's.
+    normally proceed in parallel. A shard is its own type, `shard[T]`
+    (in `shard.go`): a mutex, a map from key to `entry[T]`, and the
+    methods `update`, `delete` and `sweep`, which are the only code
+    that takes the shard's lock or touches its fields. `MapStore`
+    itself only hashes the key to pick a shard, and runs the janitor.
+  - Each `entry[T]` is the algorithm's state together with *that
+    key's* `expiresAt`. The one timestamp a shard keeps for itself,
+    `lastNow`, is not an expiry: it is the latest `now` the shard has
+    been given, which the janitor uses as its notion of the current
+    time.
+  - The shard count is 64 by default and set with `WithShards(n)`.
+    More shards mean fewer calls for different keys waiting on each
+    other, and a shorter janitor pause per shard, since each holds
+    fewer keys — the knobs that matter on machines with many more than
+    64 cores or in stores holding millions of keys. `n` must be a
+    power of two, so shard selection is a mask over the key's hash
+    rather than a division; anything else panics, like every other
+    invalid constructor argument, instead of being silently rounded.
+  - Each shard is padded to exactly one cache line (128 bytes, the
+    line size on arm64; x86-64's 64 divides it), so that locking one
+    shard doesn't invalidate the line holding a neighbour's lock.
+    Padding per shard is independent of how many shards there are,
+    but it relies on where the slice of shards starts, and that
+    depends on its size: the Go allocator prefixes an 8-byte header
+    to pointer-holding objects between 512 bytes and 32 KiB — a slice
+    of 5 to 255 shards, the default 64 included — so those slices
+    start 8 bytes past a line boundary, while all others start right
+    on one (measured for every count from 1 to 4096). That shift is
+    harmless as long as the fields a call writes, which sit before the
+    padding, still fit in the first line after it. Two compile-time
+    checks in `shard.go` hold the layout to that: a shard must be
+    exactly one cache line, and its written fields plus the 8-byte
+    shift must fit in a 64-byte line. Adding a field without keeping
+    both true stops the package from building.
   - `UpdateFunc` returns the `Result` instead of assigning it to a
     captured variable, and `Update` passes it back. This looks like a
     detail and is not: a `Result` captured by a closure escapes to
@@ -489,7 +523,7 @@ Tests exercise the public API and nothing else.
   `algorithms_test`, `validate_test` — so a test can only reach what a
   caller can. There is no `export_test.go` opening internals up to
   tests, and production code carries no hooks that exist only for
-  tests (no option to change the shard count, for instance). A test
+  tests (no unexported option or accessor that only tests call). A test
   that can only be written against internals is testing an
   implementation detail, and is dropped rather than accommodated.
 - **Internal mechanisms are tested through what they promise
