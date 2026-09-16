@@ -9,15 +9,15 @@ import (
 )
 
 // SlidingWindowState is the state SlidingWindowLog keeps for one key:
-// the timestamp of every request still inside the trailing window,
-// oldest first.
+// the timestamp, in nanoseconds since the Unix epoch, of every request
+// still inside the trailing window, oldest first.
 //
 // Its field is deliberately unexported: the type is exported only so
 // a caller can name it when building the store that holds it
 // (ratelimit.NewMapStore[algorithms.SlidingWindowState]()). Its zero
 // value is a key that has not been seen yet.
 type SlidingWindowState struct {
-	timestamps []time.Time
+	timestamps []int64
 }
 
 // SlidingWindowLog allows up to limit requests within any trailing
@@ -55,21 +55,21 @@ func NewSlidingWindowLog(limit int, window time.Duration, store ratelimit.KeySto
 	}
 }
 
-func (s *SlidingWindowLog) Allow(ctx context.Context, now time.Time, key string) (ratelimit.Result, error) {
+func (s *SlidingWindowLog) Allow(ctx context.Context, now int64, key string) (ratelimit.Result, error) {
 	return s.AllowN(ctx, now, key, 1)
 }
 
-func (s *SlidingWindowLog) AllowN(ctx context.Context, now time.Time, key string, n int) (ratelimit.Result, error) {
-	return s.store.Update(ctx, key, func(state SlidingWindowState, _ bool) (SlidingWindowState, ratelimit.Result, error) {
+func (s *SlidingWindowLog) AllowN(ctx context.Context, now int64, key string, n int) (ratelimit.Result, error) {
+	return s.store.Update(ctx, now, key, func(state SlidingWindowState, _ bool) (SlidingWindowState, int64, ratelimit.Result, error) {
 		state.timestamps = s.evict(state.timestamps, now)
 
 		if len(state.timestamps)+n > s.limit {
 			resetAt := s.resetAt(state.timestamps, now)
 			// Still written back: evict may have dropped aged-out entries.
-			return state, ratelimit.Result{
+			return state, s.expiresAt(state.timestamps, now), ratelimit.Result{
 				Allowed:    false,
 				Remaining:  s.limit - len(state.timestamps),
-				RetryAfter: resetAt.Sub(now),
+				RetryAfter: time.Duration(resetAt - now),
 				ResetAt:    resetAt,
 				Limit:      s.limit,
 			}, nil
@@ -78,7 +78,7 @@ func (s *SlidingWindowLog) AllowN(ctx context.Context, now time.Time, key string
 		for i := 0; i < n; i++ {
 			state.timestamps = append(state.timestamps, now)
 		}
-		return state, ratelimit.Result{
+		return state, s.expiresAt(state.timestamps, now), ratelimit.Result{
 			Allowed:   true,
 			Remaining: s.limit - len(state.timestamps),
 			ResetAt:   s.resetAt(state.timestamps, now),
@@ -90,10 +90,10 @@ func (s *SlidingWindowLog) AllowN(ctx context.Context, now time.Time, key string
 // evict drops every timestamp that has aged out of the trailing
 // window. Timestamps are always appended in non-decreasing order, so
 // the survivors are a suffix and a single forward scan finds them.
-func (s *SlidingWindowLog) evict(timestamps []time.Time, now time.Time) []time.Time {
-	threshold := now.Add(-s.window)
+func (s *SlidingWindowLog) evict(timestamps []int64, now int64) []int64 {
+	threshold := now - int64(s.window)
 	i := 0
-	for i < len(timestamps) && !timestamps[i].After(threshold) {
+	for i < len(timestamps) && timestamps[i] <= threshold {
 		i++
 	}
 	return timestamps[i:]
@@ -102,9 +102,19 @@ func (s *SlidingWindowLog) evict(timestamps []time.Time, now time.Time) []time.T
 // resetAt is when the oldest recorded request ages out of the
 // window, freeing the next slot. With no recorded requests the
 // window already has room, so it resolves to now.
-func (s *SlidingWindowLog) resetAt(timestamps []time.Time, now time.Time) time.Time {
+func (s *SlidingWindowLog) resetAt(timestamps []int64, now int64) int64 {
 	if len(timestamps) == 0 {
 		return now
 	}
-	return timestamps[0].Add(s.window)
+	return timestamps[0] + int64(s.window)
+}
+
+// expiresAt is when the newest recorded request ages out, leaving an
+// empty log — the same as a key with no state. A log that is already
+// empty has nothing worth keeping, so it expires right away.
+func (s *SlidingWindowLog) expiresAt(timestamps []int64, now int64) int64 {
+	if len(timestamps) == 0 {
+		return now
+	}
+	return timestamps[len(timestamps)-1] + int64(s.window)
 }

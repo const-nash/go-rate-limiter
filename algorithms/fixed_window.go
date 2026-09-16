@@ -19,8 +19,9 @@ import (
 // (ratelimit.NewMapStore[algorithms.FixedWindowState]()). Its zero
 // value is a key that has not been seen yet.
 type FixedWindowState struct {
-	count       int
-	windowStart time.Time
+	count int
+	// windowStart is in nanoseconds since the Unix epoch.
+	windowStart int64
 }
 
 // FixedWindowCounter allows up to limit requests per fixed-size
@@ -56,28 +57,30 @@ func NewFixedWindowCounter(limit int, window time.Duration, store ratelimit.KeyS
 	}
 }
 
-func (f *FixedWindowCounter) Allow(ctx context.Context, now time.Time, key string) (ratelimit.Result, error) {
+func (f *FixedWindowCounter) Allow(ctx context.Context, now int64, key string) (ratelimit.Result, error) {
 	return f.AllowN(ctx, now, key, 1)
 }
 
-func (f *FixedWindowCounter) AllowN(ctx context.Context, now time.Time, key string, n int) (ratelimit.Result, error) {
-	return f.store.Update(ctx, key, func(state FixedWindowState, _ bool) (FixedWindowState, ratelimit.Result, error) {
+func (f *FixedWindowCounter) AllowN(ctx context.Context, now int64, key string, n int) (ratelimit.Result, error) {
+	return f.store.Update(ctx, now, key, func(state FixedWindowState, _ bool) (FixedWindowState, int64, ratelimit.Result, error) {
 		f.advance(&state, now)
-		resetAt := state.windowStart.Add(f.window)
+		// Once the window ends, advance would reset this state anyway,
+		// so from resetAt on it is as good as absent: that is its expiry.
+		resetAt := state.windowStart + int64(f.window)
 
 		if state.count+n > f.limit {
 			// Still written back: advance may have rolled the window over.
-			return state, ratelimit.Result{
+			return state, resetAt, ratelimit.Result{
 				Allowed:    false,
 				Remaining:  f.limit - state.count,
-				RetryAfter: resetAt.Sub(now),
+				RetryAfter: time.Duration(resetAt - now),
 				ResetAt:    resetAt,
 				Limit:      f.limit,
 			}, nil
 		}
 
 		state.count += n
-		return state, ratelimit.Result{
+		return state, resetAt, ratelimit.Result{
 			Allowed:   true,
 			Remaining: f.limit - state.count,
 			ResetAt:   resetAt,
@@ -88,14 +91,14 @@ func (f *FixedWindowCounter) AllowN(ctx context.Context, now time.Time, key stri
 
 // advance rolls state.windowStart forward to the window that contains
 // now, resetting count, whenever the current window has elapsed.
-// Windows are aligned to absolute time (via Truncate) rather than to
-// the key's first request, so window boundaries are deterministic
-// regardless of when a given key happens to make its first call.
-func (f *FixedWindowCounter) advance(state *FixedWindowState, now time.Time) {
-	windowEnd := state.windowStart.Add(f.window)
-	if now.Before(windowEnd) {
+// Windows are aligned to the Unix epoch rather than to the key's
+// first request, so window boundaries are deterministic regardless of
+// when a given key happens to make its first call.
+func (f *FixedWindowCounter) advance(state *FixedWindowState, now int64) {
+	window := int64(f.window)
+	if now < state.windowStart+window {
 		return
 	}
-	state.windowStart = now.Truncate(f.window)
+	state.windowStart = now - now%window
 	state.count = 0
 }

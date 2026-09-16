@@ -12,7 +12,7 @@ import (
 func TestFixedWindowCounter_AllowsUpToLimit(t *testing.T) {
 	ctx := context.Background()
 	fw := algorithms.NewFixedWindowCounter(3, time.Minute, ratelimit.NewMapStore[algorithms.FixedWindowState]())
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := at(0)
 
 	for i := 0; i < 3; i++ {
 		res, err := fw.Allow(ctx, now, "u1")
@@ -39,7 +39,7 @@ func TestFixedWindowCounter_AllowsUpToLimit(t *testing.T) {
 func TestFixedWindowCounter_ResetsAfterWindowElapses(t *testing.T) {
 	ctx := context.Background()
 	fw := algorithms.NewFixedWindowCounter(1, time.Minute, ratelimit.NewMapStore[algorithms.FixedWindowState]())
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := at(0)
 
 	res, err := fw.Allow(ctx, now, "u1")
 	if err != nil {
@@ -49,13 +49,13 @@ func TestFixedWindowCounter_ResetsAfterWindowElapses(t *testing.T) {
 		t.Fatal("expected first request to be allowed")
 	}
 
-	if res, err := fw.Allow(ctx, now.Add(30*time.Second), "u1"); err != nil {
+	if res, err := fw.Allow(ctx, at(30*time.Second), "u1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	} else if res.Allowed {
 		t.Fatal("expected second request within the same window to be denied")
 	}
 
-	res, err = fw.Allow(ctx, now.Add(time.Minute), "u1")
+	res, err = fw.Allow(ctx, at(time.Minute), "u1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestFixedWindowCounter_ResetsAfterWindowElapses(t *testing.T) {
 func TestFixedWindowCounter_AllowN(t *testing.T) {
 	ctx := context.Background()
 	fw := algorithms.NewFixedWindowCounter(10, time.Minute, ratelimit.NewMapStore[algorithms.FixedWindowState]())
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := at(0)
 
 	res, err := fw.AllowN(ctx, now, "u1", 7)
 	if err != nil {
@@ -92,7 +92,7 @@ func TestFixedWindowCounter_AllowN(t *testing.T) {
 func TestFixedWindowCounter_RetryAfterAndResetAt(t *testing.T) {
 	ctx := context.Background()
 	fw := algorithms.NewFixedWindowCounter(1, time.Minute, ratelimit.NewMapStore[algorithms.FixedWindowState]())
-	now := time.Date(2026, 1, 1, 0, 0, 30, 0, time.UTC)
+	now := at(30 * time.Second)
 
 	if _, err := fw.Allow(ctx, now, "u1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -102,12 +102,12 @@ func TestFixedWindowCounter_RetryAfterAndResetAt(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	wantResetAt := now.Truncate(time.Minute).Add(time.Minute)
-	if !res.ResetAt.Equal(wantResetAt) {
-		t.Fatalf("expected ResetAt %v, got %v", wantResetAt, res.ResetAt)
+	wantResetAt := at(time.Minute)
+	if res.ResetAt != wantResetAt {
+		t.Fatalf("expected ResetAt %v, got %v", fmtNano(wantResetAt), fmtNano(res.ResetAt))
 	}
 
-	wantRetryAfter := wantResetAt.Sub(now)
+	wantRetryAfter := 30 * time.Second
 	if res.RetryAfter != wantRetryAfter {
 		t.Fatalf("expected RetryAfter %v, got %v", wantRetryAfter, res.RetryAfter)
 	}
@@ -116,7 +116,7 @@ func TestFixedWindowCounter_RetryAfterAndResetAt(t *testing.T) {
 func TestFixedWindowCounter_IsolatesKeys(t *testing.T) {
 	ctx := context.Background()
 	fw := algorithms.NewFixedWindowCounter(1, time.Minute, ratelimit.NewMapStore[algorithms.FixedWindowState]())
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := at(0)
 
 	if res, err := fw.Allow(ctx, now, "u1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -157,5 +157,27 @@ func TestFixedWindowCounter_InvalidArgsPanic(t *testing.T) {
 			}()
 			algorithms.NewFixedWindowCounter(tt.limit, tt.window, ratelimit.NewMapStore[algorithms.FixedWindowState]())
 		})
+	}
+}
+
+func TestFixedWindowCounter_ExpiresAtWindowEnd(t *testing.T) {
+	ctx := context.Background()
+	store := newExpirySpy[algorithms.FixedWindowState]()
+	fw := algorithms.NewFixedWindowCounter(1, time.Minute, store)
+
+	if _, err := fw.Allow(ctx, at(10*time.Second), "u1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := at(time.Minute); store.lastExpiresAt != want {
+		t.Fatalf("allowed: expected expiry at window end %v, got %v", fmtNano(want), fmtNano(store.lastExpiresAt))
+	}
+
+	if res, err := fw.Allow(ctx, at(20*time.Second), "u1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if res.Allowed {
+		t.Fatal("expected second request within the window to be denied")
+	}
+	if want := at(time.Minute); store.lastExpiresAt != want {
+		t.Fatalf("denied: expected expiry at window end %v, got %v", fmtNano(want), fmtNano(store.lastExpiresAt))
 	}
 }

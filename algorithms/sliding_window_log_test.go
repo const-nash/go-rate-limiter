@@ -12,7 +12,7 @@ import (
 func TestSlidingWindowLog_AllowsUpToLimit(t *testing.T) {
 	ctx := context.Background()
 	sw := algorithms.NewSlidingWindowLog(3, time.Minute, ratelimit.NewMapStore[algorithms.SlidingWindowState]())
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := at(0)
 
 	for i := 0; i < 3; i++ {
 		res, err := sw.Allow(ctx, now, "u1")
@@ -39,27 +39,27 @@ func TestSlidingWindowLog_AllowsUpToLimit(t *testing.T) {
 func TestSlidingWindowLog_SlidesGradually(t *testing.T) {
 	ctx := context.Background()
 	sw := algorithms.NewSlidingWindowLog(2, time.Minute, ratelimit.NewMapStore[algorithms.SlidingWindowState]())
-	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	base := at(0)
 
 	if res, err := sw.Allow(ctx, base, "u1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	} else if !res.Allowed {
 		t.Fatal("expected first request to be allowed")
 	}
-	if res, err := sw.Allow(ctx, base.Add(30*time.Second), "u1"); err != nil {
+	if res, err := sw.Allow(ctx, at(30*time.Second), "u1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	} else if !res.Allowed {
 		t.Fatal("expected second request to be allowed")
 	}
 
-	if res, err := sw.Allow(ctx, base.Add(59*time.Second), "u1"); err != nil {
+	if res, err := sw.Allow(ctx, at(59*time.Second), "u1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	} else if res.Allowed {
 		t.Fatal("expected third request to be denied while both prior requests are still in the window")
 	}
 
 	// The request at t=0 ages out once now-window is past it, i.e. now > 1m.
-	if res, err := sw.Allow(ctx, base.Add(61*time.Second), "u1"); err != nil {
+	if res, err := sw.Allow(ctx, at(61*time.Second), "u1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	} else if !res.Allowed {
 		t.Fatal("expected request to be allowed once the oldest timestamp aged out")
@@ -67,7 +67,7 @@ func TestSlidingWindowLog_SlidesGradually(t *testing.T) {
 
 	// Unlike a fixed window, the window slid rather than resetting
 	// entirely: the request at t=30s is still counted here.
-	if res, err := sw.Allow(ctx, base.Add(62*time.Second), "u1"); err != nil {
+	if res, err := sw.Allow(ctx, at(62*time.Second), "u1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	} else if res.Allowed {
 		t.Fatal("expected request to be denied since only one slot had freed up")
@@ -77,7 +77,7 @@ func TestSlidingWindowLog_SlidesGradually(t *testing.T) {
 func TestSlidingWindowLog_AllowN(t *testing.T) {
 	ctx := context.Background()
 	sw := algorithms.NewSlidingWindowLog(10, time.Minute, ratelimit.NewMapStore[algorithms.SlidingWindowState]())
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := at(0)
 
 	res, err := sw.AllowN(ctx, now, "u1", 7)
 	if err != nil {
@@ -102,7 +102,7 @@ func TestSlidingWindowLog_AllowN(t *testing.T) {
 func TestSlidingWindowLog_RetryAfterAndResetAt(t *testing.T) {
 	ctx := context.Background()
 	sw := algorithms.NewSlidingWindowLog(1, time.Minute, ratelimit.NewMapStore[algorithms.SlidingWindowState]())
-	now := time.Date(2026, 1, 1, 0, 0, 30, 0, time.UTC)
+	now := at(30 * time.Second)
 
 	if _, err := sw.Allow(ctx, now, "u1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -112,12 +112,12 @@ func TestSlidingWindowLog_RetryAfterAndResetAt(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	wantResetAt := now.Add(time.Minute)
-	if !res.ResetAt.Equal(wantResetAt) {
-		t.Fatalf("expected ResetAt %v, got %v", wantResetAt, res.ResetAt)
+	wantResetAt := at(90 * time.Second)
+	if res.ResetAt != wantResetAt {
+		t.Fatalf("expected ResetAt %v, got %v", fmtNano(wantResetAt), fmtNano(res.ResetAt))
 	}
 
-	wantRetryAfter := wantResetAt.Sub(now)
+	wantRetryAfter := time.Minute
 	if res.RetryAfter != wantRetryAfter {
 		t.Fatalf("expected RetryAfter %v, got %v", wantRetryAfter, res.RetryAfter)
 	}
@@ -126,7 +126,7 @@ func TestSlidingWindowLog_RetryAfterAndResetAt(t *testing.T) {
 func TestSlidingWindowLog_IsolatesKeys(t *testing.T) {
 	ctx := context.Background()
 	sw := algorithms.NewSlidingWindowLog(1, time.Minute, ratelimit.NewMapStore[algorithms.SlidingWindowState]())
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := at(0)
 
 	if res, err := sw.Allow(ctx, now, "u1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -167,5 +167,39 @@ func TestSlidingWindowLog_InvalidArgsPanic(t *testing.T) {
 			}()
 			algorithms.NewSlidingWindowLog(tt.limit, tt.window, ratelimit.NewMapStore[algorithms.SlidingWindowState]())
 		})
+	}
+}
+
+func TestSlidingWindowLog_ExpiresWhenNewestRequestAgesOut(t *testing.T) {
+	ctx := context.Background()
+	store := newExpirySpy[algorithms.SlidingWindowState]()
+	sw := algorithms.NewSlidingWindowLog(2, time.Minute, store)
+
+	if _, err := sw.Allow(ctx, at(0), "u1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := sw.Allow(ctx, at(30*time.Second), "u1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := at(90 * time.Second); store.lastExpiresAt != want {
+		t.Fatalf("expected expiry when the newest request ages out %v, got %v", fmtNano(want), fmtNano(store.lastExpiresAt))
+	}
+}
+
+func TestSlidingWindowLog_EmptyLogExpiresImmediately(t *testing.T) {
+	ctx := context.Background()
+	store := newExpirySpy[algorithms.SlidingWindowState]()
+	sw := algorithms.NewSlidingWindowLog(2, time.Minute, store)
+	now := at(0)
+
+	// Asking for more than the limit on a fresh key is denied and
+	// records nothing, so there is no state worth keeping.
+	if res, err := sw.AllowN(ctx, now, "u1", 3); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if res.Allowed {
+		t.Fatal("expected request above the limit to be denied")
+	}
+	if store.lastExpiresAt != now {
+		t.Fatalf("expected an empty log to expire at now %v, got %v", fmtNano(now), fmtNano(store.lastExpiresAt))
 	}
 }

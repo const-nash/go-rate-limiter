@@ -37,15 +37,15 @@ deliberately leaves to the caller.
 classDiagram
     class Algorithm {
         <<interface>>
-        +Allow(ctx Context, now time.Time, key string) (Result, error)
-        +AllowN(ctx Context, now time.Time, key string, n int) (Result, error)
+        +Allow(ctx Context, now int64, key string) (Result, error)
+        +AllowN(ctx Context, now int64, key string, n int) (Result, error)
     }
 
     class Result {
         +Allowed bool
         +Remaining int
         +RetryAfter time.Duration
-        +ResetAt time.Time
+        +ResetAt int64
         +Limit int
     }
 
@@ -59,41 +59,54 @@ classDiagram
 
     class Clock {
         <<interface>>
-        +Now() time.Time
+        +Now() int64
     }
 
     class SystemClock {
-        +Now() time.Time
+        +Now() int64
     }
 
     class KeyStore~T~ {
         <<interface>>
-        +Update(ctx Context, key string, fn UpdateFunc~T~) (Result, error)
+        +Update(ctx Context, now int64, key string, fn UpdateFunc~T~) (Result, error)
         +Delete(ctx Context, key string) error
     }
 
     class UpdateFunc~T~ {
         <<function>>
-        +func(prev T, ok bool) (next T, out Result, err error)
+        +func(prev T, ok bool) (next T, expiresAt int64, out Result, err error)
     }
 
     class MapStore~T~ {
         -seed maphash.Seed
         -shards []mapShard~T~
-        +NewMapStore~T~() *MapStore~T~
-        +Update(ctx Context, key string, fn UpdateFunc~T~) (Result, error)
+        -stop chan struct
+        -done chan struct
+        +NewMapStore~T~(opts ...MapStoreOption) *MapStore~T~
+        +WithCleanupInterval(interval time.Duration) MapStoreOption
+        +Update(ctx Context, now int64, key string, fn UpdateFunc~T~) (Result, error)
         +Delete(ctx Context, key string) error
+        +Close() error
     }
 
     class mapShard~T~ {
         -mu sync.Mutex
-        -items map[string]T
+        -items map[string]entry~T~
+        -lastNow int64
+        -peak int
+    }
+
+    class entry~T~ {
+        -value T
+        -expiresAt int64
     }
 
     class validate {
         <<utility>>
         +Rate(rate float64) error
         +Window(window time.Duration) error
+        +Limit(limit int) error
+        +CleanupInterval(interval time.Duration) error
     }
 
     class TokenBucket {
@@ -101,8 +114,8 @@ classDiagram
         -burst int
         -store KeyStore~TokenBucketState~
         +NewTokenBucket(rate float64, burst int, store KeyStore~TokenBucketState~) *TokenBucket
-        +Allow(ctx Context, now time.Time, key string) (Result, error)
-        +AllowN(ctx Context, now time.Time, key string, n int) (Result, error)
+        +Allow(ctx Context, now int64, key string) (Result, error)
+        +AllowN(ctx Context, now int64, key string, n int) (Result, error)
     }
 
     class LeakyBucket {
@@ -110,8 +123,8 @@ classDiagram
         -capacity int
         -store KeyStore~LeakyBucketState~
         +NewLeakyBucket(rate float64, capacity int, store KeyStore~LeakyBucketState~) *LeakyBucket
-        +Allow(ctx Context, now time.Time, key string) (Result, error)
-        +AllowN(ctx Context, now time.Time, key string, n int) (Result, error)
+        +Allow(ctx Context, now int64, key string) (Result, error)
+        +AllowN(ctx Context, now int64, key string, n int) (Result, error)
     }
 
     class FixedWindowCounter {
@@ -119,8 +132,8 @@ classDiagram
         -window time.Duration
         -store KeyStore~FixedWindowState~
         +NewFixedWindowCounter(limit int, window time.Duration, store KeyStore~FixedWindowState~) *FixedWindowCounter
-        +Allow(ctx Context, now time.Time, key string) (Result, error)
-        +AllowN(ctx Context, now time.Time, key string, n int) (Result, error)
+        +Allow(ctx Context, now int64, key string) (Result, error)
+        +AllowN(ctx Context, now int64, key string, n int) (Result, error)
     }
 
     class SlidingWindowLog {
@@ -128,8 +141,8 @@ classDiagram
         -window time.Duration
         -store KeyStore~SlidingWindowState~
         +NewSlidingWindowLog(limit int, window time.Duration, store KeyStore~SlidingWindowState~) *SlidingWindowLog
-        +Allow(ctx Context, now time.Time, key string) (Result, error)
-        +AllowN(ctx Context, now time.Time, key string, n int) (Result, error)
+        +Allow(ctx Context, now int64, key string) (Result, error)
+        +AllowN(ctx Context, now int64, key string, n int) (Result, error)
     }
 
     Limiter o-- Algorithm : holds (composition)
@@ -158,9 +171,9 @@ classDiagram
 
 The concrete algorithms don't share configuration parameters (each
 one interprets "rate" in its own shape — `rate+burst` vs
-`limit+window`), but two things are shared across the whole design:
+`limit+window`), but three things are shared across the whole design:
 
-- **`Clock`** — a small interface (`Now() time.Time`). Unlike
+- **`Clock`** — a small interface (`Now() int64`). Unlike
   `rate`/`limit`/`window`, "current time" means exactly the same
   thing for every algorithm, so it doesn't belong to any specific
   algorithm — it's a required parameter of `Limiter`'s constructor
@@ -171,6 +184,27 @@ one interprets "rate" in its own shape — `rate+burst` vs
   unit-test on its own — just call `Allow(ctx, fixedTime, key)`, no
   fake clock or mock needed. In production code the caller passes the
   library's `SystemClock`; there is no implicit default.
+
+  Time is an `int64` of nanoseconds since the Unix epoch everywhere
+  in the library — `now`, every timestamp an algorithm stores, the
+  expiry it reports, `Result.ResetAt` — rather than a `time.Time`. A
+  `time.Time` is 24 bytes against the `int64`'s 8, and every algorithm
+  stores at least one per key (the sliding window log stores one per
+  request). Durations stay `time.Duration`, which is already an
+  `int64` of nanoseconds, so `now + int64(window)` costs nothing.
+
+  The type alone doesn't protect against the wall clock being
+  stepped, though — `time.Now().UnixNano()` jumps with NTP just as a
+  `time.Time` without its monotonic reading does. `SystemClock` is
+  what does: it reads the wall clock once, when the package
+  initializes, and adds the monotonic time elapsed since, so it never
+  goes backwards yet still reads as Unix time (fixed windows keep
+  lining up with round wall-clock boundaries). It is also cheaper than
+  `time.Now()`, since it only reads the monotonic clock. The trade-off
+  is that it doesn't follow deliberate corrections of the wall clock
+  either, and on Linux it stands still while the machine is suspended;
+  processes sharing a distributed store agree on time only as well as
+  their clocks agreed when each started.
 - **`validate`** — a small set of package-level helper functions
   (`validate.Rate`, `validate.Window`, ...) that each algorithm's
   constructor calls to reject invalid input (`rate <= 0`,
@@ -181,7 +215,7 @@ one interprets "rate" in its own shape — `rate+burst` vs
   state (`Update`/`Delete`, keyed by a plain `string`). Each
   algorithm owns the *shape* of its own state (`FixedWindowCounter`
   needs `{count, windowStart}`, `SlidingWindowLog` needs
-  `[]time.Time`, ...) and the store is parameterized on it, so the
+  `[]int64`, ...) and the store is parameterized on it, so the
   state is stored as its own type rather than as an `any`. A
   `KeyStore[T]` is passed into an algorithm's constructor
   (`NewFixedWindowCounter(limit, window, store)`), not owned by
@@ -243,10 +277,14 @@ one interprets "rate" in its own shape — `rate+burst` vs
     lock of its own any more.**
   - `MapStore` spreads keys over independently locked shards rather
     than guarding one map with one mutex, so calls for different keys
-    normally proceed in parallel. The shard count is a power of two,
-    which makes shard selection a mask over the key's hash; each
-    shard is padded to its own cache line so that locking one shard
-    doesn't invalidate a neighbour's.
+    normally proceed in parallel. There are always 64 shards: a power
+    of two, which makes shard selection a mask over the key's hash,
+    and comfortably above `GOMAXPROCS` on ordinary hardware, so
+    concurrent callers rarely collide. The count is deliberately not
+    configurable — nothing observable through the API depends on it,
+    and a knob that exists only to be tuned in benchmarks isn't worth
+    its surface. Each shard is padded to its own cache line so that
+    locking one shard doesn't invalidate a neighbour's.
   - `UpdateFunc` returns the `Result` instead of assigning it to a
     captured variable, and `Update` passes it back. This looks like a
     detail and is not: a `Result` captured by a closure escapes to
@@ -258,10 +296,58 @@ one interprets "rate" in its own shape — `rate+burst` vs
     transaction guarding the key, so it must not block: no I/O, no
     reentrant store calls. A network-backed store may also retry it
     on conflict, so it must be a pure function of its arguments.
-  - There is no key eviction yet — a key, once seen, keeps its entry
-    in the store forever. Fine for now (the library has no users
-    yet), but a longer-lived process with a growing set of keys will
-    need a TTL/eviction policy before this goes into production use.
+  - **Expiry is split between algorithm and store the same way
+    atomicity is.** Only the algorithm knows when a key's state stops
+    mattering — a fixed window's when the window ends, a sliding log's
+    when its newest request ages out, a token bucket's once it has
+    refilled — so its `UpdateFunc` returns that instant as
+    `expiresAt`. Only the store knows how to forget a key, so it does:
+    `MapStore` with a background sweep, a Redis-backed store with
+    `PEXPIREAT` in the same script as the update.
+
+    This works because of one invariant every algorithm must keep:
+    **from `expiresAt` on, the state is indistinguishable from an
+    absent key.** Dropping it then never changes a decision, so the
+    store is free to drop it whenever it likes. An algorithm that
+    can't vouch for that returns `math.MaxInt64`, and one whose state
+    is already as good as absent returns `now` or earlier, which tells
+    the store not to keep it at all.
+  - `Update` takes the caller's `now`, and the store judges expiry
+    against it rather than against a clock of its own: an entry past
+    its expiry reads as absent (`ok=false`) immediately. The same goes
+    for `MapStore`'s janitor, which has no clock either — it uses the
+    latest `now` any `Update` has been given (tracked per shard, under
+    the lock `Update` already holds, so it costs nothing on the hot
+    path). A store with its own clock would be one misconfiguration
+    away from disaster: a Limiter on a fake clock in a test, a store
+    on the real one, and the janitor wipes every key the moment it
+    runs. The price is that a store receiving no calls at all isn't
+    swept until calls resume. The janitor also stays `sweepGrace`
+    (one second) behind the latest time it has seen, because a call
+    can reach the store carrying a `now` read a moment before
+    another call's.
+  - The janitor is opt-in (`NewMapStore[T](WithCleanupInterval(d))`)
+    and walks the shards one at a time, holding only the lock of the
+    shard it is sweeping. A sweep costs roughly 25–30 ns per entry, so
+    each shard pauses for its own share of keys only. A Go map never
+    returns memory on `delete`, so after dropping expired entries the
+    janitor also rebuilds any shard whose map has fallen to a quarter
+    of its peak size (for peaks of at least 1024 entries); without
+    that, a one-off burst of keys — a scan across many IPs — would pin
+    its memory for good.
+  - A store with a janitor is stopped with `Close()`, not a
+    `context.Context` given to the constructor. `ctx` already means
+    "this one call" on `Update` and `Delete`; a second, lifetime `ctx`
+    on the same type invites passing a request context by mistake,
+    after which the janitor stops silently and the memory leak it
+    exists to prevent comes back with no symptom. `Close()` also waits
+    for the janitor to exit, which a cancellation can't. Callers who
+    do manage lifetimes with a context bridge it in one line:
+    `context.AfterFunc(ctx, func() { store.Close() })`.
+  - There is no size cap. Evicting a *live* key to make room resets
+    its quota, so an attacker flooding the store with fresh keys could
+    push a throttled key out and bypass its limit. Expiry only ever
+    drops state that no longer affects a decision.
 
 `Limiter` still knows nothing about `rate`, `window`, `key`, or any
 other algorithm-specific parameter — those stay owned by the concrete
@@ -314,7 +400,8 @@ able to call without depending on unrelated algorithm code.
 
 The client picks and creates a concrete algorithm implementation
 (passing it a `KeyStore[T]` for that algorithm's own state type,
-typically `ratelimit.NewMapStore[algorithms.FixedWindowState]()`),
+typically `ratelimit.NewMapStore[algorithms.FixedWindowState]()` with
+`ratelimit.WithCleanupInterval(...)`, and a deferred `Close()`),
 then passes the algorithm — together with a `Clock` — into `Limiter`
 via `New`. From that point on, the client calls
 `Limiter.Allow(ctx, key)` with a `context.Context` (for cancellation,
@@ -329,7 +416,8 @@ flowchart LR
     A["client code"] -->|"algorithms.NewTokenBucket(rate, burst, store)"| B["TokenBucket\n(Algorithm)"]
     A -->|"ratelimit.New(algorithm, clock)"| C["Limiter"]
     A -->|"SystemClock{}"| E["Clock"]
-    A -->|"ratelimit.NewMapStore[TokenBucketState]()"| R["MapStore[T]\n(KeyStore[T])"]
+    A -->|"ratelimit.NewMapStore[TokenBucketState](WithCleanupInterval(d))"| R["MapStore[T]\n(KeyStore[T])"]
+    A -.->|"defer store.Close()"| R
     R -.->|"passed in as\nKeyStore"| B
     B -.->|"passed in as\nAlgorithm"| C
     E -.->|"passed in as\nClock"| C
@@ -352,32 +440,82 @@ To add a new rate-limiting algorithm:
    atomicity is the store's job — it does not need a `Clock` field
    (time is received per call), and it does not store per-key state
    as its own fields; that lives in the store, addressed by key.
-2. Implement `Allow(ctx context.Context, now time.Time, key string)
+2. Implement `Allow(ctx context.Context, now int64, key string)
    (ratelimit.Result, error)` and `AllowN(ctx context.Context, now
-   time.Time, key string, n int) (ratelimit.Result, error)`,
-   satisfying the `ratelimit.Algorithm` interface. `AllowN` should be
-   a single `store.Update` call whose `UpdateFunc` computes the next
-   state and the `Result` together and returns both; `Allow` is
-   `AllowN(..., 1)`. Return the state even when denying the request,
-   since it may still have changed (a window rolling over, entries
-   aging out). Fill in whichever `Result` fields the algorithm can
-   meaningfully compute (at least `Allowed`; typically `RetryAfter`
-   and `Remaining` too).
+   int64, key string, n int) (ratelimit.Result, error)`, satisfying
+   the `ratelimit.Algorithm` interface. `AllowN` should be a single
+   `store.Update(ctx, now, key, fn)` call whose `UpdateFunc` computes
+   the next state, its expiry, and the `Result` together and returns
+   all three; `Allow` is `AllowN(..., 1)`. Return the state even when
+   denying the request, since it may still have changed (a window
+   rolling over, entries aging out). Fill in whichever `Result`
+   fields the algorithm can meaningfully compute (at least `Allowed`;
+   typically `RetryAfter` and `Remaining` too). Store timestamps as
+   `int64` nanoseconds, like `now`.
 
    Inside the `UpdateFunc`: use the `ok` argument if "no state yet"
    differs from your zero value (a token bucket starts a new key at
    full burst, not at zero tokens); do no I/O and take no locks, and
    assume it may be called more than once for one `Update` if the
    store retries.
+
+   For `expiresAt`, return the earliest instant from which the new
+   state would lead to exactly the same decisions as an absent key —
+   no earlier, since the store may drop the key from then on. If
+   there is no such instant, return `math.MaxInt64`; if the state is
+   already equivalent to absent, return `now`.
 3. Validate its constructor arguments using the shared
    `internal/validate` helpers.
 4. Have the constructor accept a `ratelimit.KeyStore[YourState]`
    parameter (the caller decides the backend —
-   `ratelimit.NewMapStore[YourState]()` for in-memory, or a custom
+   `ratelimit.NewMapStore[YourState](...)` for in-memory, or a custom
    implementation for something distributed). Pass an instance of the
    new struct, together with a `Clock` (typically
    `ratelimit.SystemClock`), into `ratelimit.New(algorithm, clock)`.
+5. Test it from `package algorithms_test`, through its exported API
+   only (see [Testing](#testing)): decisions and `Result` fields by
+   calling `Allow`/`AllowN` with explicit `now` values, and its
+   `expiresAt` promise through the `expirySpy` store.
 
 `Limiter` and the rest of the root package remain unchanged — they
 know nothing about keys or stores beyond the `Algorithm` and
 `KeyStore` interfaces themselves.
+
+## Testing
+
+Tests exercise the public API and nothing else.
+
+- **Every test file is an external test package** — `ratelimit_test`,
+  `algorithms_test`, `validate_test` — so a test can only reach what a
+  caller can. There is no `export_test.go` opening internals up to
+  tests, and production code carries no hooks that exist only for
+  tests (no option to change the shard count, for instance). A test
+  that can only be written against internals is testing an
+  implementation detail, and is dropped rather than accommodated.
+- **Internal mechanisms are tested through what they promise
+  outside.** `MapStore`'s janitor is invisible to decisions by design
+  — an expired entry reads as absent whether or not it has been swept
+  — so its test checks the thing the janitor is actually for: after a
+  burst of expired keys, the process's live heap (`runtime.MemStats`)
+  falls back well below the burst's peak. That one assertion covers
+  both the sweep and the map rebuild, since a Go map keeps its memory
+  after `delete`. `Close` is checked the same way: the janitor's
+  goroutine is gone afterwards (`runtime.NumGoroutine`). Both tests
+  poll with a deadline instead of sleeping a fixed time; the memory
+  test allocates a large burst and is skipped under `-short`.
+- **Test doubles implement public interfaces.** `algorithms`' tests
+  check what an algorithm promises a store (its `expiresAt`) with
+  `expirySpy`, a `KeyStore` that wraps a real `MapStore` and records
+  what passes through. That observes a public contract, not the
+  algorithm's insides.
+- **Time is explicit.** Algorithms take `now` as an argument, so their
+  tests pass fixed instants (`at(30 * time.Second)`, an offset from a
+  fixed epoch) and need no fake clock. Only `SystemClock`'s own tests
+  read real time.
+- **Shared helpers live in `_test.go` files named for what they
+  hold** — `testtime_test.go` for the time helpers, `expiryspy_test.go`
+  for the spy — rather than in a catch-all `helpers_test.go`. A
+  helper that more than one package needs belongs in its own
+  `…test` package, the way `net/http/httptest` does it; the natural
+  first candidate is a `KeyStore` conformance suite, once there is a
+  second store to run it against.
