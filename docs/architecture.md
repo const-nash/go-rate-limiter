@@ -517,7 +517,10 @@ know nothing about keys or stores beyond the `Algorithm` and
 
 ## Testing
 
-Tests exercise the public API and nothing else.
+Tests exercise the public API and nothing else. Benchmarks do too, and
+have a document of their own: [benchmarks.md](benchmarks.md) covers
+what each one is for, how to run and compare them, and the current
+baseline.
 
 - **Every test file is an external test package** — `ratelimit_test`,
   `algorithms_test`, `validate_test` — so a test can only reach what a

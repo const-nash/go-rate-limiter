@@ -26,3 +26,6 @@ go.work.sum
 .env
 
 /.idea/
+
+# Benchmark and coverage output (see docs/benchmarks.md)
+.bench/
